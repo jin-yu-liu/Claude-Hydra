@@ -1,4 +1,7 @@
-//! Optional per-account isolation in a Sandboxie-Plus box (Windows only, opt-in per environment).
+//! Optional per-account isolation, opt-in per environment: a Sandboxie-Plus box on Windows, or a
+//! Seatbelt profile (`macos.rs`) on macOS. The Windows box also virtualizes files and the
+//! registry; the macOS profile only confines the network and verifies that confinement before the
+//! account starts.
 //!
 //! Without a box, Claude's network is routed through the account's relay by Chromium switches
 //! and proxy variables, which a process may ignore. Inside a box, Sandboxie enforces it:
@@ -228,6 +231,9 @@ pub fn forget(id: &str) {
     let name = box_name(id);
     let _ = std::fs::remove_dir_all(code_dir(id));
     let _ = std::fs::remove_file(crate::paths::storage_root().join("sandbox").join(format!("{name}.proxy")));
+    // The macOS profile is a file of ours, so deleting the account can remove it.
+    #[cfg(target_os = "macos")]
+    let _ = std::fs::remove_file(crate::macos::profile_path(id));
     #[cfg(windows)]
     if let Ok(dir) = available() {
         // Only a box Hydra configured for this account: it exists and is named by the id's hash.
@@ -277,10 +283,20 @@ fn install_dir() -> Option<PathBuf> {
 #[cfg(not(windows))]
 fn install_dir() -> Option<PathBuf> { None }
 
-/// The Sandboxie-Plus folder, or a user-facing reason it cannot be used.
+/// The isolation layer available on this system, or a user-facing reason it cannot be used.
 pub fn available() -> Result<PathBuf, String> {
-    if !cfg!(windows) { return Err("沙箱隔离目前只支持 Windows（Sandboxie-Plus）。".into()); }
-    install_dir().ok_or_else(|| "没有检测到 Sandboxie-Plus。请先安装 Sandboxie-Plus（需要管理员权限并安装驱动），再启用沙箱隔离。".into())
+    #[cfg(windows)]
+    {
+        return install_dir().ok_or_else(|| "没有检测到 Sandboxie-Plus。请先安装 Sandboxie-Plus（需要管理员权限并安装驱动），再启用沙箱隔离。".into());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        return crate::macos::available();
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        Err("沙箱隔离目前只支持 Windows（Sandboxie-Plus）与 macOS（Seatbelt）。".into())
+    }
 }
 
 /// Whether this process itself runs inside a Sandboxie box.
@@ -304,6 +320,7 @@ fn ini(dir: &Path, args: &[&str]) -> Result<(), String> {
 
 /// Sandboxie resolves UserSettings_ to the calling user's settings section.
 /// Apply once on explicit request, since controller auto-start is shared by all boxes.
+#[cfg(windows)]
 pub fn configure_quiet_start() -> Result<(), String> {
     let dir = available()?;
     let section = "UserSettings_";
@@ -312,6 +329,11 @@ pub fn configure_quiet_start() -> Result<(), String> {
     ini(&dir, &["delete", section, "SbieCtrl_HideMessage", detail])?;
     ini(&dir, &["append", section, "SbieCtrl_HideMessage", detail])
 }
+
+/// Nothing to configure on macOS: `sandbox-exec` starts with the account, there is no shared
+/// controller to keep quiet.
+#[cfg(not(windows))]
+pub fn configure_quiet_start() -> Result<(), String> { Ok(()) }
 
 /// Creates or updates the account's box. `relay_port` = the only address the box may reach;
 /// `None` (no node) leaves the network unrestricted. Each box gets its own Code directory.

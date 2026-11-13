@@ -465,57 +465,13 @@ pub fn refresh(url: &str) -> Result<String, String> {
 
 // ---- credential sealing -------------------------------------------------------------
 
-/// Seals a secret for `settings.json`: DPAPI (current Windows user) on Windows. Elsewhere the
-/// settings file lives in a per-user directory and is written with owner-only permissions.
-pub fn seal(secret: &str) -> String {
-    if secret.is_empty() { return String::new(); }
-    #[cfg(windows)]
-    if let Some(sealed) = win::protect(secret.as_bytes()) {
-        use base64::{engine::general_purpose::STANDARD, Engine};
-        return format!("dpapi:{}", STANDARD.encode(sealed));
-    }
-    format!("plain:{secret}")
-}
+/// Seals a secret for `settings.json`; `secret` owns the per-platform scheme (DPAPI, the macOS
+/// login Keychain, or owner-only file permissions as the last resort).
+pub fn seal(secret: &str) -> String { crate::secret::seal(secret) }
 
-/// `None` when the stored value cannot be decrypted by this user on this machine.
-pub fn try_unseal(stored: &str) -> Option<String> {
-    if let Some(rest) = stored.strip_prefix("plain:") { return Some(rest.to_string()); }
-    #[cfg(windows)]
-    if let Some(rest) = stored.strip_prefix("dpapi:") {
-        use base64::{engine::general_purpose::STANDARD, Engine};
-        return STANDARD.decode(rest).ok().and_then(|b| win::unprotect(&b)).and_then(|b| String::from_utf8(b).ok());
-    }
-    if stored.starts_with("dpapi:") { return None; }
-    Some(stored.to_string())
-}
+pub fn try_unseal(stored: &str) -> Option<String> { crate::secret::try_unseal(stored) }
 
-pub fn unseal(stored: &str) -> String {
-    try_unseal(stored).unwrap_or_default()
-}
-
-#[cfg(windows)]
-mod win {
-    use std::ffi::c_void;
-    #[repr(C)] struct Blob { len: u32, data: *mut u8 }
-    #[link(name = "crypt32")] extern "system" {
-        fn CryptProtectData(input: *const Blob, description: *const u16, entropy: *const Blob, reserved: *mut c_void, prompt: *mut c_void, flags: u32, output: *mut Blob) -> i32;
-        fn CryptUnprotectData(input: *const Blob, description: *mut *mut u16, entropy: *const Blob, reserved: *mut c_void, prompt: *mut c_void, flags: u32, output: *mut Blob) -> i32;
-    }
-    #[link(name = "kernel32")] extern "system" { fn LocalFree(mem: *mut c_void) -> *mut c_void; }
-    const UI_FORBIDDEN: u32 = 1;
-    fn run(data: &[u8], protect: bool) -> Option<Vec<u8>> {
-        let input = Blob { len: data.len() as u32, data: data.as_ptr() as *mut u8 };
-        let mut out = Blob { len: 0, data: std::ptr::null_mut() };
-        let ok = unsafe {
-            if protect { CryptProtectData(&input, std::ptr::null(), std::ptr::null(), std::ptr::null_mut(), std::ptr::null_mut(), UI_FORBIDDEN, &mut out) }
-            else { CryptUnprotectData(&input, std::ptr::null_mut(), std::ptr::null(), std::ptr::null_mut(), std::ptr::null_mut(), UI_FORBIDDEN, &mut out) }
-        };
-        if ok == 0 { return None; }
-        unsafe { let v = std::slice::from_raw_parts(out.data, out.len as usize).to_vec(); LocalFree(out.data as *mut c_void); Some(v) }
-    }
-    pub fn protect(data: &[u8]) -> Option<Vec<u8>> { run(data, true) }
-    pub fn unprotect(data: &[u8]) -> Option<Vec<u8>> { run(data, false) }
-}
+pub fn unseal(stored: &str) -> String { crate::secret::unseal(stored) }
 
 // ---- launch arguments ---------------------------------------------------------------
 

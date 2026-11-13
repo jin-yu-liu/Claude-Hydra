@@ -204,7 +204,7 @@ const FINGERPRINT_JS: &str = r#"(function () {
 })();
 "#;
 
-fn fingerprint_script(id: &str) -> String { FINGERPRINT_JS.replace("__SEED__", &fingerprint_seed(id).to_string()) }
+pub(crate) fn fingerprint_script(id: &str) -> String { FINGERPRINT_JS.replace("__SEED__", &fingerprint_seed(id).to_string()) }
 
 /// Hosts whose links belong to the account (sign-in, account pages).
 fn is_claude_host(host: &str) -> bool {
@@ -607,6 +607,7 @@ mod tests {
 
 /// The Node-side of `fingerprint_script_changes_what_the_page_measures`: the smallest browser
 /// the script can run against, so its overrides are exercised for real rather than only parsed.
+#[cfg(test)]
 const FINGERPRINT_HARNESS: &str = r#"const fs = require('fs');
 global.window = global;
 function Context(canvas) { this.canvas = canvas; }

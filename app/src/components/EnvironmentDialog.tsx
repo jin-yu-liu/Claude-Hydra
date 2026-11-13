@@ -7,6 +7,10 @@ import { Button } from "./ui/button";
 import { Dialog } from "./ui/dialog";
 import { Input, Select, Textarea } from "./ui/input";
 
+const IS_MAC = navigator.userAgent.includes("Mac");
+/** The isolation switch keeps its wire value; only what it means differs per platform. */
+const ISOLATION_NAME = IS_MAC ? "macOS 沙盒" : "Sandboxie-Plus";
+
 interface Props {
   open: boolean;
   /** Existing environment id, or null to create a new one. */
@@ -47,7 +51,7 @@ export function EnvironmentDialog({ open, id, initial, detectedTimezone, exitBas
     setEnv(initial ? { ...emptyEnvironment(), ...structuredClone(initial) } : emptyEnvironment());
     setError("");
     setBaseline(exitBaseline ? `${exitBaseline.ip}${place(exitBaseline) ? `（${place(exitBaseline)}）` : ""}` : null);
-    api.sandboxStatus().then((dir) => setSandbox({ ok: true, text: `已检测到 Sandboxie-Plus：${dir}` }), (e) => setSandbox({ ok: false, text: errorText(e) }));
+    api.sandboxStatus().then((dir) => setSandbox({ ok: true, text: IS_MAC ? "已检测到 macOS 沙盒（Seatbelt / sandbox-exec）" : `已检测到 Sandboxie-Plus：${dir}` }), (e) => setSandbox({ ok: false, text: errorText(e) }));
   }, [open, initial, exitBaseline]);
 
   const rebind = async () => {
@@ -141,11 +145,11 @@ export function EnvironmentDialog({ open, id, initial, detectedTimezone, exitBas
                 : env.separateCode ? "每个账号有自己的 Claude Code 登录、配置与会话目录" : "与本机的 Claude Code 共用登录和会话（~/.claude）"}</span>
             </Line>
             <Line label="沙箱隔离">
-              <Switch checked={env.isolation === "sandboxie"} disabled={!sandbox?.ok && env.isolation !== "sandboxie"} onCheckedChange={(v) => setEnv({ ...env, isolation: v ? "sandboxie" : "" })} label="在 Sandboxie-Plus 沙箱中运行" />
-              <span className="text-[11.5px] text-muted">{env.isolation === "sandboxie" ? "在 Sandboxie-Plus 沙箱中运行" : "不使用沙箱"}</span>
+              <Switch checked={env.isolation === "sandboxie"} disabled={!sandbox?.ok && env.isolation !== "sandboxie"} onCheckedChange={(v) => setEnv({ ...env, isolation: v ? "sandboxie" : "" })} label={IS_MAC ? "在 macOS 沙盒中运行" : "在 Sandboxie-Plus 沙箱中运行"} />
+              <span className="text-[11.5px] text-muted">{env.isolation === "sandboxie" ? `在 ${ISOLATION_NAME} 中运行` : "不使用沙箱"}</span>
             </Line>
             <p className="px-4 pb-3 text-[11.5px] leading-relaxed text-muted">
-              {env.isolation === "sandboxie" && sandbox?.ok && <span className="mb-2 block">
+              {env.isolation === "sandboxie" && sandbox?.ok && !IS_MAC && <span className="mb-2 block">
                 <Button variant="outline" disabled={quietStatus !== "idle"} onClick={async () => {
                   setQuietStatus("applying");
                   try { await api.configureQuietSandbox(); setQuietStatus("done"); }
@@ -154,7 +158,9 @@ export function EnvironmentDialog({ open, id, initial, detectedTimezone, exitBas
                 <span className="mt-1 block">立即应用到当前 Windows 用户的所有沙箱。启动时不自动打开 Sandboxie Control，并隐藏 ConsoleInit (C00000D4) 提示。</span>
               </span>}
               {env.isolation === "sandboxie"
-                ? "沙箱中只允许连接本账号的本地中继，任何绕过代理的进程都会断网；文件和注册表写入留在沙箱内（账号数据目录除外）。沙箱内无法经本机 DNS 解析外部域名，域名只经代理解析。商店版会先复制一份到 Hydra 数据目录再装入沙箱（首次较慢）；系统默认账号不能使用环境。启动后会核实 Claude 确实在沙箱中运行，否则立即关闭。"
+                ? (IS_MAC
+                  ? "启动前用 macOS 的 Seatbelt 沙盒验证：沙盒内只能连接本机回环（中继），直连外部地址会被内核拒绝，验证不通过就不启动。账号浏览页的 Canvas / WebGL / GPU / 字体测量 / 屏幕等网页指纹按账号派生（尽力而为，需要 Claude 提供调试端口，失败会记录日志）。注意：主机名、网卡 MAC、IOPlatformUUID、序列号等系统级硬件标识仍与主机相同——macOS 不像 Sandboxie 那样能按进程改写这些内核值，只有虚拟机才能完全隔离。"
+                  : "沙箱中只允许连接本账号的本地中继，任何绕过代理的进程都会断网；文件和注册表写入留在沙箱内（账号数据目录除外）。沙箱内无法经本机 DNS 解析外部域名，域名只经代理解析。商店版会先复制一份到 Hydra 数据目录再装入沙箱（首次较慢）；系统默认账号不能使用环境。启动后会核实 Claude 确实在沙箱中运行，否则立即关闭。")
                 : "不用沙箱时：Claude 与它启动的工具都经本地中继出网（无直连回退），出口不合规则时会自动断网；但忽略代理设置的程序仍可能直连。"}
               {sandbox && !sandbox.ok && <span className="block text-warn">{sandbox.text}</span>}
             </p>

@@ -126,19 +126,41 @@ pub fn launch(install: &Install, p: &Profile) -> Result<&'static str, String> {
     #[cfg(target_os = "macos")]
     {
         let app = install.aumid.clone().ok_or("找不到 Claude.app。")?;
-        let mut cmd = Command::new("/usr/bin/open");
-        cmd.args(["-n", "-a", &app]);
-        for (k, v) in &env {
-            cmd.args(["--env", &format!("{k}={v}")]);
-        }
         let mut pass: Vec<String> = Vec::new();
         if !p.is_default {
             pass.push(format!("--user-data-dir={}", p.path));
         }
         pass.extend(managed);
         pass.extend(extra.split_whitespace().map(str::to_string));
+        if sandboxed {
+            // macOS isolation: a Seatbelt profile denies everything except loopback, so the only
+            // way out is the account's relay. The profile is proven before Claude starts; a check
+            // that does not hold refuses the launch instead of running unconfined.
+            let profile = crate::macos::configure(&p.id, relay_port).map_err(|e| format!("账号未启动：{e}"))?;
+            crate::macos::verify(&profile, relay_port).map_err(|e| format!("账号未启动：{e}"))?;
+            let exe = install.launch_exe().ok_or("找不到 Claude 的启动程序。Claude 可能正在更新，请稍后再试。")?;
+            // Page fingerprint: Claude is Electron, so a DevTools port lets the account's
+            // Canvas/WebGL/font/screen script in before the first page runs. Only accounts with
+            // their own data directory have a place for the port file.
+            let debug_port = if p.is_default { None } else { crate::macos::free_port() };
+            if let Some(port) = debug_port {
+                pass.push(format!("--remote-debugging-port={port}"));
+            }
+            let mut cmd = crate::macos::command(&profile, &exe, &pass, &env);
+            cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+            cmd.spawn().map_err(|e| format!("无法启动 Claude：{e}"))?;
+            if !p.is_default {
+                crate::macos::inject_fingerprint(PathBuf::from(p.path.clone()), crate::browser::fingerprint_script(&p.id));
+            }
+            return confirm_running(install, p).map(|_| outcome);
+        }
+        let mut cmd = Command::new("/usr/bin/open");
+        cmd.args(["-n", "-a", &app]);
+        for (k, v) in &env {
+            cmd.args(["--env", &format!("{k}={v}")]);
+        }
         if !pass.is_empty() {
-            cmd.arg("--args").args(pass);
+            cmd.arg("--args").args(&pass);
         }
         cmd.stdout(Stdio::null()).stderr(Stdio::null());
         let status = cmd.status().map_err(|e| format!("无法启动 Claude：{e}"))?;

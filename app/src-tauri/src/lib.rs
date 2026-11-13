@@ -10,6 +10,8 @@ pub mod launcher;
 pub mod login;
 #[cfg(target_os = "macos")]
 mod mac_url;
+pub mod macos;
+pub mod macos_isolation;
 pub mod paths;
 pub mod profiles;
 pub mod node;
@@ -18,6 +20,7 @@ mod releases;
 pub mod sandbox;
 pub mod clash;
 mod relay;
+pub mod secret;
 pub mod sessions;
 pub mod settings;
 pub mod sys;
@@ -709,6 +712,10 @@ pub fn run(start_in_tray: bool) {
             browser::start_watcher(handle.clone());
             browser::remember_fallback();
             environment::migrate();
+            // A settings file written before the Keychain was used still holds `plain:` secrets;
+            // re-seal them in the background (it may wait for the login Keychain to unlock).
+            #[cfg(target_os = "macos")]
+            std::thread::spawn(|| crate::secret::migrate_settings_file(&crate::paths::settings_path()));
             // Starting Clash-node relays waits for each Mihomo core; keep the window responsive.
             std::thread::spawn(|| { clash::sweep_stale_runs(); relay::sync_all(); });
             let list = current_install(&handle).map(|i| profiles::list(&i, true)).unwrap_or_default();
