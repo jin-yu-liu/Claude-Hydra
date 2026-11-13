@@ -160,6 +160,12 @@ fn set_injection(dir: &Path, name: &str, key: &str, guards: &[Option<PathBuf>]) 
     Ok(())
 }
 
+/// Unreachable off Windows: `configure` stops at `available()` first.
+#[cfg(not(windows))]
+fn set_injection(_dir: &Path, _name: &str, _key: &str, _guards: &[Option<PathBuf>]) -> Result<(), String> {
+    Err("沙箱隔离目前只支持 Windows（Sandboxie-Plus）。".into())
+}
+
 /// Whether the account's Claude (a 64-bit process) has every guard this box needs loaded.
 /// `None` when that cannot be determined (no guard in this build, or its modules cannot be
 /// listed).
@@ -421,6 +427,7 @@ fn home() -> Option<PathBuf> {
 
 /// Where the box keeps its copy of `host_path`: Sandboxie maps the user profile to
 /// `user\current` and every other path to `drive\<letter>`.
+#[cfg_attr(not(windows), allow(dead_code))]
 fn box_copy(root: &Path, host_path: &Path) -> Option<PathBuf> {
     if let Some(rest) = home().and_then(|h| host_path.strip_prefix(h).ok().map(Path::to_path_buf)) {
         return Some(root.join("user").join("current").join(rest));
@@ -477,6 +484,7 @@ fn query_box_path(dir: &Path, name: &str) -> Result<(i32, String, String), Strin
     Ok((status.unwrap_or(-1), text(&file), text(&key)))
 }
 
+#[cfg_attr(not(windows), allow(dead_code))] // only the Windows sandbox launch uses it
 const GITCONFIG_MARK: &str = "# Claude-Hydra: sandbox copy of the global git config";
 
 /// Git reads proxies from its config before the environment, so a host config that sends git
@@ -484,6 +492,7 @@ const GITCONFIG_MARK: &str = "# Claude-Hydra: sandbox copy of the global git con
 /// box. The box gets its own `~/.gitconfig`: the host file followed by `http.proxy` and every
 /// site-specific proxy pointed at the relay. Rewritten at each launch (so host edits carry
 /// over; changes made from inside the box are replaced) and removed without a relay.
+#[cfg_attr(not(windows), allow(dead_code))] // only the Windows sandbox launch uses it
 fn sync_box_gitconfig(root: &Path, relay_port: Option<u16>) -> Result<(), String> {
     let Some(host) = home().map(|h| h.join(".gitconfig")) else { return Ok(()) };
     let Some(copy) = box_copy(root, &host) else { return Ok(()) };
@@ -499,6 +508,7 @@ fn sync_box_gitconfig(root: &Path, relay_port: Option<u16>) -> Result<(), String
     std::fs::write(&copy, content).map_err(|e| format!("无法写入账号沙箱的 git 配置：{e}"))
 }
 
+#[cfg_attr(not(windows), allow(dead_code))] // only the Windows sandbox launch uses it
 fn gitconfig_for_box(host: &Path, original: &str, sites: &[String], port: u16) -> String {
     let proxy = format!("http://127.0.0.1:{port}");
     let mut out = format!("{GITCONFIG_MARK} ({}); regenerated at every launch.\n", host.display());
@@ -513,6 +523,7 @@ fn gitconfig_for_box(host: &Path, original: &str, sites: &[String], port: u16) -
 }
 
 /// URLs with their own `http.<url>.proxy` in the host's system or global git config.
+#[cfg_attr(not(windows), allow(dead_code))] // only the Windows sandbox launch uses it
 fn site_proxies() -> Vec<String> {
     let mut cmd = Command::new("git");
     #[cfg(windows)]
@@ -531,6 +542,7 @@ fn site_proxies() -> Vec<String> {
 
 /// Copies Claude Code files a box kept for itself before its folders were opened (sessions
 /// started in the box) to the real folders, without replacing anything there.
+#[cfg_attr(not(windows), allow(dead_code))] // only the Windows sandbox launch uses it
 fn recover_claude_code_data(root: &Path, paths: &[PathBuf]) {
     fn merge(from: &Path, to: &Path) {
         let Ok(entries) = std::fs::read_dir(from) else { return };

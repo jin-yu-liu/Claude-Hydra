@@ -24,6 +24,7 @@ use std::os::windows::process::CommandExt;
 use std::time::Duration;
 
 const START_URL: &str = "https://claude.ai/login";
+#[cfg(windows)]
 const URL_PROGID: &str = "ClaudeHydra.URL";
 
 fn hex_id(id: &str) -> String { crate::sandbox::box_name(id).trim_start_matches("Hydra_").to_string() }
@@ -221,6 +222,8 @@ pub struct Plan {
     id: String,
     title: String,
     relay_port: Option<u16>,
+    /// Applied by the WebView2 browser; other platforms have no account browser.
+    #[cfg_attr(not(windows), allow(dead_code))]
     timezone: Option<String>,
     locale: String,
     url: String,
@@ -607,6 +610,7 @@ mod tests {
 
 /// The Node-side of `fingerprint_script_changes_what_the_page_measures`: the smallest browser
 /// the script can run against, so its overrides are exercised for real rather than only parsed.
+#[cfg(test)]
 const FINGERPRINT_HARNESS: &str = r#"const fs = require('fs');
 global.window = global;
 function Context(canvas) { this.canvas = canvas; }
@@ -635,7 +639,8 @@ global.DOMRect = DOMRect;
 global.Screen = Screen;
 global.screen = new Screen();
 global.Navigator = Navigator;
-global.navigator = new Navigator();
+// Node 21+ has its own read-only global navigator; plain assignment would be ignored.
+Object.defineProperty(global, 'navigator', { value: new Navigator(), configurable: true, writable: true });
 eval(fs.readFileSync(process.argv[2], 'utf8'));
 const canvas = new Canvas();
 const first = canvas.toDataURL();

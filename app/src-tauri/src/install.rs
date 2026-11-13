@@ -82,6 +82,8 @@ impl Install {
     /// can even be split, with a few files mirrored into `LocalCache` and the rest in the real
     /// folder. So every place the data could be is checked and the one Claude used is taken.
     pub fn data_dir(&self, path: &Path) -> PathBuf {
+        // Only Store builds on Windows add further places to look.
+        #[cfg_attr(not(windows), allow(unused_mut))]
         let mut candidates = vec![path.to_path_buf()];
         #[cfg(windows)]
         if let Some(cache) = self.package_cache() {
