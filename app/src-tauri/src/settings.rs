@@ -203,6 +203,12 @@ fn locked<T>(path: &Path, run: impl FnOnce() -> T) -> T {
     out
 }
 
+/// Runs `run` under the same lock as `update`/`save`, for a writer that edits the file as raw
+/// JSON (the secret migration). Not reentrant either.
+pub fn with_lock<T>(path: &Path, run: impl FnOnce() -> T) -> T {
+    locked(path, run)
+}
+
 pub fn save(settings: &Settings) -> Result<(), String> {
     let path = crate::paths::settings_path();
     locked(&path, || save_to(&path, settings))

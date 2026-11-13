@@ -5,17 +5,18 @@
 //! macOS build calls it. The two mechanisms are deliberately separate:
 //!
 //! - **Network**: `sandbox-exec` applies a per-account profile (inherited by every child process)
-//!   that denies outbound connections except to loopback, where the account's relay listens. The
-//!   profile is *verified* before the account is started: if a direct connection still succeeds,
-//!   the launch is refused. `sandbox-exec` is deprecated by Apple but still shipped; when it is
-//!   missing the caller reports that isolation is unavailable instead of silently running
-//!   unconfined.
+//!   that denies outbound connections except to the account's relay port on loopback. The
+//!   profile is *verified* before the account is started: if a direct connection, or a connection
+//!   to any other loopback port, still succeeds, the launch is refused. `sandbox-exec` is
+//!   deprecated by Apple but still shipped; when it is missing the caller reports that isolation
+//!   is unavailable instead of silently running unconfined.
 //! - **Page fingerprint**: Claude Desktop is Electron. Started with a remote-debugging port it
 //!   accepts a DevTools connection on loopback, which installs the same per-account Canvas /
-//!   WebGL / font / screen shim the Windows account browser uses. This needs no code signing and
-//!   no SIP change, but it is script-level: if Claude does not expose the port, the fingerprint is
-//!   simply not applied (logged), and anything the process reads outside its renderer still sees
-//!   the host.
+//!   WebGL / font / screen shim the Windows account browser uses. The script lives as long as the
+//!   DevTools session that installed it, so each page's session is held open. This needs no code
+//!   signing and no SIP change, but it is script-level: if Claude does not expose the port, the
+//!   fingerprint is simply not applied (logged), and anything the process reads outside its
+//!   renderer still sees the host.
 //!
 //! Hardware identifiers (`IOPlatformUUID`, serial numbers, the real MAC addresses) are *not*
 //! touched: on macOS those are kernel values a process cannot rewrite without injection, and no
@@ -24,8 +25,10 @@
 #![allow(dead_code)]
 
 use crate::macos_isolation::{
-    cdp_commands, devtools_port, handshake_request, masked_frame, page_targets, read_frame, seatbelt_profile,
+    cdp_commands, devtools_port, handshake_request, masked_frame, page_targets, read_frame, reload_command, reply_to,
+    seatbelt_profile, Target, INSTALL_ID,
 };
+use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
@@ -77,10 +80,11 @@ fn probe(profile: &Path, program: &str, args: &[&str]) -> Result<std::process::O
         .map_err(|e| format!("无法运行 macOS 沙盒自检：{e}"))
 }
 
-/// Proves the profile works before the account starts: it loads, a direct connection is refused,
-/// and (when a relay exists) the relay is reachable. Anything else refuses the launch. Without a
-/// relay the profile has no network rules (there is no exit to send the account through), so only
-/// the load check applies - the same behaviour as the Windows box.
+/// Proves the profile works before the account starts: it loads, the relay is reachable, any
+/// other loopback port is refused (a host proxy such as Clash would otherwise be a way out) and a
+/// direct connection is refused. Anything else refuses the launch. Without a relay the profile has
+/// no network rules (there is no exit to send the account through), so only the load check
+/// applies - the same behaviour as the Windows box.
 pub fn verify(profile: &Path, relay_port: Option<u16>) -> Result<(), String> {
     let loaded = probe(profile, "/usr/bin/true", &[])?;
     if !loaded.status.success() {
@@ -93,6 +97,15 @@ pub fn verify(profile: &Path, relay_port: Option<u16>) -> Result<(), String> {
     let relay = probe(profile, NC, &["-z", "-w", "2", "127.0.0.1", &port.to_string()])?;
     if !relay.status.success() {
         return Err("macOS 沙盒自检失败：本机中继在沙盒内不可达，已停止启动，避免 Claude 在无可达出口的情况下运行。".into());
+    }
+    // A listener of our own, outside the sandbox: the kernel completes the connection from its
+    // backlog, so `nc -z` succeeds exactly when the profile lets the sandbox reach that port.
+    let other = std::net::TcpListener::bind(("127.0.0.1", 0)).map_err(|e| format!("无法运行 macOS 沙盒自检：{e}"))?;
+    let other_port = other.local_addr().map_err(|e| format!("无法运行 macOS 沙盒自检：{e}"))?.port();
+    let loopback = probe(profile, NC, &["-z", "-w", "2", "127.0.0.1", &other_port.to_string()])?;
+    drop(other);
+    if loopback.status.success() {
+        return Err("macOS 沙盒自检失败：沙盒内仍能连到本机中继以外的端口（例如本机代理），已停止启动，避免 Claude 绕开账号中继。".into());
     }
     let direct = probe(profile, NC, &["-z", "-w", "2", "1.1.1.1", "443"])?;
     if direct.status.success() {
@@ -118,59 +131,67 @@ pub fn free_port() -> Option<u16> {
 
 // ---- page fingerprint ----------------------------------------------------------------
 
-/// Watches for Claude's DevTools endpoint and installs the account's fingerprint script in every
-/// page that appears. Runs in the background; a Claude that never opens the port, or a WebSocket
-/// that is refused, leaves the pages untouched (and is logged once).
+/// Removes the port file a previous run left behind, so the watcher cannot read a stale port
+/// (by now possibly another process's). Called before Claude is started.
+pub fn clear_devtools_port(data_dir: &Path) {
+    let _ = std::fs::remove_file(data_dir.join("DevToolsActivePort"));
+}
+
+/// Watches Claude's DevTools endpoint for as long as it lives and installs the account's
+/// fingerprint script in every page that appears. The script belongs to the DevTools session that
+/// installed it, so each page keeps its own connection open until the page goes away. A Claude
+/// that never opens the port, or a page that refuses the install, is logged and left untouched.
 pub fn inject_fingerprint(data_dir: PathBuf, script: String) {
     std::thread::spawn(move || watch(&data_dir, &script));
 }
 
 fn watch(data_dir: &Path, script: &str) {
-    let deadline = Instant::now() + Duration::from_secs(120);
-    let mut injected: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut port: Option<u16> = None;
-    let mut waits = 0u32;
+    // The port file appears once Claude's browser process is up.
+    let mut port = None;
+    for _ in 0..40 {
+        port = std::fs::read_to_string(data_dir.join("DevToolsActivePort")).ok().and_then(|text| devtools_port(&text));
+        if port.is_some() { break; }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    let Some(port) = port else {
+        crate::paths::append_log(
+            "hydra-error.log",
+            "account browser fingerprint: Claude exposed no DevTools port; page fingerprint not applied",
+        );
+        return;
+    };
+    let mut seen: HashSet<String> = HashSet::new();
     let mut failures = 0u32;
-    while Instant::now() < deadline {
-        if port.is_none() {
-            port = std::fs::read_to_string(data_dir.join("DevToolsActivePort"))
-                .ok()
-                .and_then(|text| devtools_port(&text));
-            if port.is_none() {
-                waits += 1;
-                if waits == 40 {
-                    crate::paths::append_log(
-                        "hydra-error.log",
-                        "account browser fingerprint: Claude exposed no DevTools port; page fingerprint not applied",
-                    );
-                    return;
-                }
-                std::thread::sleep(Duration::from_millis(500));
-                continue;
-            }
-        }
-        let current = port.unwrap_or_default();
-        match http_get(current, "/json/list") {
+    // Until the endpoint stops answering: Claude has quit, and every page session with it.
+    while failures < 30 {
+        match http_get(port, "/json/list") {
             Some(list) => {
                 failures = 0;
-                for url in page_targets(&list) {
-                    if injected.contains(&url) { continue; }
-                    if inject_into(current, &url, script) {
-                        injected.insert(url);
+                for target in page_targets(&list) {
+                    if !seen.insert(target.socket.clone()) { continue; }
+                    match attach(port, &target, script) {
+                        Ok(()) => crate::paths::append_log(
+                            "hydra.log",
+                            &format!("account browser fingerprint: installed in page {}", short_url(&target.url)),
+                        ),
+                        Err(reason) => crate::paths::append_log(
+                            "hydra-error.log",
+                            &format!("account browser fingerprint: not installed in page {}: {reason}", short_url(&target.url)),
+                        ),
                     }
                 }
             }
-            None => {
-                failures += 1;
-                // A dead endpoint means Claude went away; stop instead of polling a stale file.
-                if failures >= 30 { break; }
-                port = None;
-            }
+            None => failures += 1,
         }
         std::thread::sleep(Duration::from_millis(700));
     }
-    if !injected.is_empty() {
-        crate::paths::append_log("hydra.log", &format!("account browser fingerprint: installed in {} page(s)", injected.len()));
+}
+
+/// Scheme and host only: the log should not carry conversation paths or query strings.
+fn short_url(url: &str) -> String {
+    match url.split_once("://") {
+        Some((scheme, rest)) => format!("{scheme}://{}", rest.split(['/', '?', '#']).next().unwrap_or_default()),
+        None => url.chars().take(40).collect(),
     }
 }
 
@@ -184,41 +205,77 @@ fn http_get(port: u16, path: &str) -> Option<String> {
     Some(body.to_string())
 }
 
-fn inject_into(port: u16, debugger_url: &str, script: &str) -> bool {
-    let rest = debugger_url.strip_prefix("ws://").unwrap_or(debugger_url);
-    let Some(slash) = rest.find('/') else { return false };
-    let path = &rest[slash..];
-    let mut stream = match TcpStream::connect(("127.0.0.1", port)) {
-        Ok(stream) => stream,
-        Err(_) => return false,
-    };
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
+fn send(stream: &mut TcpStream, opcode: u8, payload: &[u8]) -> std::io::Result<()> {
+    let mask = random::<4>().unwrap_or([1, 2, 3, 4]);
+    stream.write_all(&masked_frame(opcode, payload, mask))
+}
+
+/// Opens a DevTools session on the page, installs the script, waits for Chromium to confirm it,
+/// reloads a web page so the document already showing gets it too, and hands the session to a
+/// thread that keeps it open (answering pings) until the page closes.
+fn attach(port: u16, target: &Target, script: &str) -> Result<(), String> {
+    let rest = target.socket.strip_prefix("ws://").unwrap_or(&target.socket);
+    let path = rest.find('/').map(|slash| &rest[slash..]).ok_or("bad debugger url")?;
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).map_err(|e| format!("connect: {e}"))?;
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
     let key = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, random::<16>().unwrap_or([0u8; 16]));
-    if stream.write_all(handshake_request("127.0.0.1", port, path, &key).as_bytes()).is_err() {
-        return false;
-    }
+    stream
+        .write_all(handshake_request("127.0.0.1", port, path, &key).as_bytes())
+        .map_err(|e| format!("handshake: {e}"))?;
     // Byte-wise so the header read does not consume the first frame.
     let mut header = Vec::new();
     let mut byte = [0u8; 1];
     loop {
-        if stream.read_exact(&mut byte).is_err() { return false; }
+        stream.read_exact(&mut byte).map_err(|e| format!("handshake: {e}"))?;
         header.push(byte[0]);
         if header.ends_with(b"\r\n\r\n") { break; }
-        if header.len() > 8192 { return false; }
+        if header.len() > 8192 { return Err("handshake: header too long".into()); }
     }
-    if !String::from_utf8_lossy(&header).starts_with("HTTP/1.1 101") { return false; }
+    let header = String::from_utf8_lossy(&header);
+    if !header.starts_with("HTTP/1.1 101") {
+        return Err(format!("handshake refused: {}", header.lines().next().unwrap_or_default()));
+    }
     for message in cdp_commands(script) {
-        let mask = random::<4>().unwrap_or([1, 2, 3, 4]);
-        if stream.write_all(&masked_frame(1, message.as_bytes(), mask)).is_err() { return false; }
+        send(&mut stream, 1, message.as_bytes()).map_err(|e| format!("send: {e}"))?;
     }
-    // Drain the two replies so the socket does not stay half-read; their contents are not needed.
-    for _ in 0..2 {
-        match read_frame(&mut stream) {
-            Ok(Some(_)) => {}
-            _ => break,
+    // Events (from Page.enable) may arrive first; only the install's own reply counts.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if Instant::now() > deadline { return Err("no reply to the install".into()); }
+        let frame = read_frame(&mut stream)
+            .map_err(|e| format!("read: {e}"))?
+            .ok_or("closed before the install was confirmed")?;
+        match frame.opcode {
+            8 => return Err("closed before the install was confirmed".into()),
+            9 => send(&mut stream, 10, &frame.payload).map_err(|e| format!("pong: {e}"))?,
+            _ => match reply_to(&frame.payload, INSTALL_ID) {
+                Some(true) => break,
+                Some(false) => return Err(format!("install refused: {}", String::from_utf8_lossy(&frame.payload))),
+                None => {}
+            },
         }
     }
-    true
+    if target.reload_after_install() {
+        send(&mut stream, 1, reload_command().as_bytes()).map_err(|e| format!("reload: {e}"))?;
+    }
+    let _ = stream.set_read_timeout(None);
+    std::thread::spawn(move || keep_open(stream));
+    Ok(())
+}
+
+/// Holds the page's DevTools session (and with it the installed script) until the page or Claude
+/// closes it. Events are read and dropped; pings are answered so the session stays up.
+fn keep_open(mut stream: TcpStream) {
+    loop {
+        match read_frame(&mut stream) {
+            Ok(Some(frame)) if frame.opcode == 8 => break,
+            Ok(Some(frame)) if frame.opcode == 9 => {
+                if send(&mut stream, 10, &frame.payload).is_err() { break; }
+            }
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => break,
+        }
+    }
 }
 
 fn random<const N: usize>() -> Option<[u8; N]> {

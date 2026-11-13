@@ -6,17 +6,19 @@
 use std::io::Read;
 
 /// The Seatbelt profile a sandboxed account runs under. `(deny network-outbound)` is the point:
-/// the process may only reach this machine, so its only way out is the account's relay on
-/// loopback (which resolves the names). The system DNS socket is denied as well, so a name cannot
-/// be resolved locally and leak; every other file, mach and process capability is left as the
-/// system gives it (Sandboxie's file virtualization has no macOS counterpart here).
+/// the process may reach exactly one TCP port, the account's relay on loopback (which resolves
+/// the names). Not the whole loopback: a host proxy (Clash on 7890, Surge, ...) or another
+/// account's relay listens there too, and reaching one would leave through the wrong exit. The
+/// system DNS socket is denied as well, so a name cannot be resolved locally and leak; every
+/// other file, mach and process capability is left as the system gives it (Sandboxie's file
+/// virtualization has no macOS counterpart here).
 pub fn seatbelt_profile(relay_port: Option<u16>) -> String {
     let mut profile = String::from("(version 1)\n(allow default)\n");
-    if relay_port.is_some() {
+    if let Some(port) = relay_port {
         profile.push_str("(deny network-outbound)\n");
-        // `localhost:*` is every address of the loopback interface on every port; a numeric
-        // `127.0.0.1:*` is not a valid seatbelt host pattern.
-        profile.push_str("(allow network-outbound (remote ip \"localhost:*\"))\n");
+        // Seatbelt accepts only `*` or `localhost` as the host (a numeric `127.0.0.1:...` makes
+        // the whole profile invalid); the port may be a number.
+        profile.push_str(&format!("(allow network-outbound (remote ip \"localhost:{port}\"))\n"));
         profile.push_str("(allow network-outbound (remote unix-socket))\n");
         profile.push_str("(deny network-outbound (remote unix-socket (path-literal \"/var/run/mDNSResponder\")))\n");
     }
@@ -28,25 +30,64 @@ pub fn devtools_port(text: &str) -> Option<u16> {
     text.lines().next()?.trim().parse().ok()
 }
 
-/// JSON from `/json/list`: the WebSocket URL of every page or webview target. Other target types
-/// (service workers, shared workers) have no document to inject into.
-pub fn page_targets(json: &str) -> Vec<String> {
+/// A page or webview the fingerprint goes into.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Target {
+    /// `webSocketDebuggerUrl`: also the target's identity across `/json/list` polls.
+    pub socket: String,
+    /// The document it shows now.
+    pub url: String,
+}
+
+impl Target {
+    /// A web page (claude.ai and its sign-in pages) is reloaded once the script is installed, so
+    /// the document already showing is measured through it too. Claude's own shell (`file:`,
+    /// `app:` ...) is not reloaded: its state lives in the main process.
+    pub fn reload_after_install(&self) -> bool {
+        self.url.starts_with("https://") || self.url.starts_with("http://")
+    }
+}
+
+/// JSON from `/json/list`: every page or webview target. Other target types (service workers,
+/// shared workers) have no document to inject into.
+pub fn page_targets(json: &str) -> Vec<Target> {
     let Ok(serde_json::Value::Array(items)) = serde_json::from_str::<serde_json::Value>(json) else { return Vec::new() };
     items
         .iter()
         .filter(|item| matches!(item["type"].as_str(), Some("page" | "webview")))
-        .filter_map(|item| item["webSocketDebuggerUrl"].as_str().map(str::to_owned))
+        .filter_map(|item| {
+            let socket = item["webSocketDebuggerUrl"].as_str()?.to_owned();
+            Some(Target { socket, url: item["url"].as_str().unwrap_or_default().to_owned() })
+        })
         .collect()
 }
 
+/// The id of the `addScriptToEvaluateOnNewDocument` command; its reply proves the install.
+pub const INSTALL_ID: u64 = 2;
+
 /// The DevTools messages that install the script for every document this target loads from now
-/// on, including the one already loading.
+/// on. The script is owned by this DevTools session: Chromium removes it when the session
+/// detaches, so the caller must keep the connection open for as long as the page lives. It does
+/// not run in the document already showing; `reload_command` covers that one.
 pub fn cdp_commands(script: &str) -> Vec<String> {
     vec![
         serde_json::json!({ "id": 1, "method": "Page.enable" }).to_string(),
-        serde_json::json!({ "id": 2, "method": "Page.addScriptToEvaluateOnNewDocument", "params": { "source": script } })
+        serde_json::json!({ "id": INSTALL_ID, "method": "Page.addScriptToEvaluateOnNewDocument", "params": { "source": script } })
             .to_string(),
     ]
+}
+
+/// Reloads the target so its current document starts again with the script in place.
+pub fn reload_command() -> String {
+    serde_json::json!({ "id": 3, "method": "Page.reload" }).to_string()
+}
+
+/// Whether a server message is the reply to command `id`: `Some(true)` for a result,
+/// `Some(false)` for an error, `None` for an event or another command's reply.
+pub fn reply_to(payload: &[u8], id: u64) -> Option<bool> {
+    let value: serde_json::Value = serde_json::from_slice(payload).ok()?;
+    if value["id"].as_u64() != Some(id) { return None; }
+    Some(value.get("result").is_some() && value.get("error").is_none())
 }
 
 /// A client WebSocket handshake. No `Origin` header: Chromium accepts non-browser clients that
@@ -120,8 +161,9 @@ mod tests {
         let full = seatbelt_profile(Some(41000));
         assert!(full.starts_with("(version 1)\n(allow default)\n"));
         assert!(full.contains("(deny network-outbound)\n"));
-        assert!(full.contains("localhost:*"), "numeric 127.0.0.1:* is not a valid seatbelt pattern");
-        assert!(!full.contains("127.0.0.1:*"));
+        assert!(full.contains("(remote ip \"localhost:41000\")"), "only the relay's port may be reached");
+        assert!(!full.contains("localhost:*"), "the whole loopback reaches host proxies and other relays");
+        assert!(!full.contains("127.0.0.1"), "a numeric host is not a valid seatbelt pattern");
         assert!(full.contains("mDNSResponder"));
         let empty = seatbelt_profile(None);
         assert_eq!(empty, "(version 1)\n(allow default)\n");
@@ -137,15 +179,26 @@ mod tests {
     #[test]
     fn targets_keep_pages_only() {
         let json = r#"[
-            {"type":"page","webSocketDebuggerUrl":"ws://127.0.0.1:9222/devtools/page/AAA"},
-            {"type":"service_worker","webSocketDebuggerUrl":"ws://127.0.0.1:9222/devtools/page/BBB"},
-            {"type":"webview","webSocketDebuggerUrl":"ws://127.0.0.1:9222/devtools/page/CCC"}
+            {"type":"page","url":"file:///Applications/Claude.app/index.html","webSocketDebuggerUrl":"ws://127.0.0.1:9222/devtools/page/AAA"},
+            {"type":"service_worker","url":"https://claude.ai/sw.js","webSocketDebuggerUrl":"ws://127.0.0.1:9222/devtools/page/BBB"},
+            {"type":"webview","url":"https://claude.ai/new","webSocketDebuggerUrl":"ws://127.0.0.1:9222/devtools/page/CCC"}
         ]"#;
-        assert_eq!(page_targets(json), vec![
-            "ws://127.0.0.1:9222/devtools/page/AAA".to_string(),
-            "ws://127.0.0.1:9222/devtools/page/CCC".to_string()
-        ]);
+        let targets = page_targets(json);
+        let sockets: Vec<&str> = targets.iter().map(|t| t.socket.as_str()).collect();
+        assert_eq!(sockets, ["ws://127.0.0.1:9222/devtools/page/AAA", "ws://127.0.0.1:9222/devtools/page/CCC"]);
+        assert!(!targets[0].reload_after_install(), "Claude's own shell is never reloaded");
+        assert!(targets[1].reload_after_install(), "a web page is reloaded so its current document gets the script");
         assert!(page_targets("not json").is_empty());
+    }
+
+    #[test]
+    fn replies_are_matched_by_id() {
+        assert_eq!(reply_to(br#"{"id":2,"result":{"identifier":"1"}}"#, INSTALL_ID), Some(true));
+        assert_eq!(reply_to(br#"{"id":2,"error":{"code":-32601,"message":"no"}}"#, INSTALL_ID), Some(false));
+        assert_eq!(reply_to(br#"{"id":1,"result":{}}"#, INSTALL_ID), None);
+        assert_eq!(reply_to(br#"{"method":"Page.loadEventFired","params":{}}"#, INSTALL_ID), None);
+        assert_eq!(reply_to(b"garbage", INSTALL_ID), None);
+        assert!(reload_command().contains("Page.reload"));
     }
 
     #[test]

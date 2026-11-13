@@ -51,7 +51,9 @@ pub fn launch(install: &Install, p: &Profile) -> Result<&'static str, String> {
         if crate::node::args_conflict(&extra) { return Err("额外启动参数中的代理开关与代理节点冲突，请先移除。".into()); }
         // Claude pins itself to a managed egress proxy over `--proxy-server`, so the account
         // would leave through that proxy (e.g. a local Clash port) instead of its node.
-        if let Some(policy) = sys::claude_egress_policy().filter(|_| !sandboxed || crate::sandbox::available().is_err()) {
+        // Only a Sandboxie box hides that policy from Claude; a macOS Seatbelt profile does not.
+        let box_hides_policy = cfg!(windows) && sandboxed && crate::sandbox::available().is_ok();
+        if let Some(policy) = sys::claude_egress_policy().filter(|_| !box_hides_policy) {
             return Err(format!(
                 "账号未启动：系统策略为 Claude 固定了出口代理 {policy}。Claude 会忽略 Hydra 的代理节点、改走这个代理。如需改走 Hydra 配置，请切换到 Sandboxie-Plus 隔离环境；不使用代理节点的账号不受影响。"
             ));
@@ -146,9 +148,14 @@ pub fn launch(install: &Install, p: &Profile) -> Result<&'static str, String> {
             if let Some(port) = debug_port {
                 pass.push(format!("--remote-debugging-port={port}"));
             }
+            if debug_port.is_some() {
+                crate::macos::clear_devtools_port(&path);
+            }
             let mut cmd = crate::macos::command(&profile, &exe, &pass, &env);
             cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
-            cmd.spawn().map_err(|e| format!("无法启动 Claude：{e}"))?;
+            let mut child = cmd.spawn().map_err(|e| format!("无法启动 Claude：{e}"))?;
+            // `sandbox-exec` execs Claude in place, so this is Claude itself: reap it when it quits.
+            std::thread::spawn(move || { let _ = child.wait(); });
             if !p.is_default {
                 crate::macos::inject_fingerprint(PathBuf::from(p.path.clone()), crate::browser::fingerprint_script(&p.id));
             }

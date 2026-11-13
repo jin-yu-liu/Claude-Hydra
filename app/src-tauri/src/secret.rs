@@ -114,16 +114,55 @@ mod keychain {
     /// Seal format version, first byte of the decoded value.
     const VERSION: u8 = 1;
 
-    /// The master key, read once per process. `None` means the Keychain could not be used; the
-    /// caller then falls back to the file's permissions instead of losing the password.
+    /// `security` exit status for "no such item" (errSecItemNotFound).
+    const NOT_FOUND: i32 = 44;
+
+    /// What the Keychain holds under our name.
+    #[derive(Debug, PartialEq, Eq)]
+    pub enum Lookup {
+        Found([u8; 32]),
+        /// No item exists: the only case in which a new key may be created.
+        Missing,
+        /// The item may exist but could not be read (locked keychain, access denied, a damaged
+        /// value, `security` failing). A new key here would overwrite the one every existing
+        /// `keychain:` value was sealed with, so nothing is written.
+        Unavailable,
+    }
+
+    /// Interprets `security find-generic-password -w`.
+    pub fn lookup(status: Option<i32>, stdout: &[u8]) -> Lookup {
+        use super::STANDARD;
+        match status {
+            Some(0) => std::str::from_utf8(stdout)
+                .ok()
+                .and_then(|text| STANDARD.decode(text.trim()).ok())
+                .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+                .map_or(Lookup::Unavailable, Lookup::Found),
+            Some(NOT_FOUND) => Lookup::Missing,
+            _ => Lookup::Unavailable,
+        }
+    }
+
+    /// The master key. Only a key that was read or created is remembered; a failure (say the
+    /// keychain is still locked at login) is retried on the next call instead of being cached
+    /// for the life of the process. `None` means the Keychain could not be used; the caller then
+    /// falls back to the file's permissions instead of losing the password.
     pub fn master_key() -> Option<[u8; 32]> {
-        use std::sync::OnceLock;
-        static KEY: OnceLock<Option<[u8; 32]>> = OnceLock::new();
-        *KEY.get_or_init(|| {
-            if let Some(key) = load_key() { return Some(key); }
-            let key: [u8; 32] = super::random_bytes(32)?.try_into().ok()?;
-            store_key(&key).then_some(key)
-        })
+        use std::sync::Mutex;
+        static KEY: Mutex<Option<[u8; 32]>> = Mutex::new(None);
+        let mut cached = KEY.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(key) = *cached { return Some(key); }
+        let key = match load_key() {
+            Lookup::Found(key) => key,
+            Lookup::Missing => {
+                let key: [u8; 32] = super::random_bytes(32)?.try_into().ok()?;
+                if !add_key(&key) { return None; }
+                key
+            }
+            Lookup::Unavailable => return None,
+        };
+        *cached = Some(key);
+        Some(key)
     }
 
     pub fn seal(data: &[u8]) -> Option<String> {
@@ -152,19 +191,19 @@ mod keychain {
         Some(out)
     }
 
-    fn load_key() -> Option<[u8; 32]> {
-        use super::STANDARD;
-        let out = security(&["find-generic-password", "-s", SERVICE, "-a", ACCOUNT, "-w"])?;
-        if !out.status.success() { return None; }
-        let text = String::from_utf8(out.stdout).ok()?;
-        let bytes = STANDARD.decode(text.trim()).ok()?;
-        bytes.try_into().ok()
+    fn load_key() -> Lookup {
+        match security(&["find-generic-password", "-s", SERVICE, "-a", ACCOUNT, "-w"]) {
+            Some(out) => lookup(out.status.code(), &out.stdout),
+            None => Lookup::Unavailable,
+        }
     }
 
-    fn store_key(key: &[u8; 32]) -> bool {
+    /// Adds the key without `-U`: if an item appeared in the meantime, the add fails rather than
+    /// replacing the key existing values were sealed with.
+    fn add_key(key: &[u8; 32]) -> bool {
         use super::STANDARD;
         let encoded = STANDARD.encode(key);
-        let out = security(&["add-generic-password", "-U", "-s", SERVICE, "-a", ACCOUNT, "-w", &encoded]);
+        let out = security(&["add-generic-password", "-s", SERVICE, "-a", ACCOUNT, "-w", &encoded]);
         out.is_some_and(|o| o.status.success())
     }
 }
@@ -183,20 +222,47 @@ fn warn_fallback() {
 /// Re-seals every `plain:` secret in the settings file, so a file written before a key store was
 /// used moves into it. Only strings that actually got a stronger scheme are touched; a file that
 /// cannot be re-sealed is left exactly as it was. Called on macOS at startup.
+///
+/// The read-modify-write holds the settings lock, so a launch saving `last_exit` (or any other
+/// `settings::update`) at the same moment is neither lost nor overwritten with an older copy.
+/// The key is fetched first, outside the lock: the Keychain may wait for the user to unlock it,
+/// and the lock must not be held through that.
 pub fn migrate_settings_file(path: &std::path::Path) {
-    let Ok(bytes) = std::fs::read(path) else { return };
-    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&bytes) else { return };
-    if !reseal_value(&mut value) { return; }
-    let Ok(text) = serde_json::to_vec_pretty(&value) else { return };
-    let tmp = path.with_extension(format!("json.{}.migrate.tmp", std::process::id()));
-    if std::fs::write(&tmp, text).is_err() { return; }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+    if !key_ready() { return; }
+    let changed = crate::settings::with_lock(path, || {
+        let Ok(bytes) = std::fs::read(path) else { return false };
+        let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&bytes) else { return false };
+        if !reseal_value(&mut value) { return false; }
+        let Ok(text) = serde_json::to_vec_pretty(&value) else { return false };
+        let tmp = path.with_extension(format!("json.{}.migrate.tmp", std::process::id()));
+        if std::fs::write(&tmp, text).is_err() { return false; }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+        }
+        if std::fs::rename(&tmp, path).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+            return false;
+        }
+        true
+    });
+    if changed {
+        crate::paths::append_log("hydra.log", "settings secret: re-sealed plain-text secrets");
     }
-    let _ = std::fs::rename(&tmp, path);
-    crate::paths::append_log("hydra.log", "settings secret: re-sealed plain-text secrets");
+}
+
+/// Whether sealing can use a key store now (on macOS: the Keychain key is readable or was just
+/// created). Elsewhere sealing never blocks.
+fn key_ready() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        return keychain::master_key().is_some();
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        true
+    }
 }
 
 /// Replaces `plain:` strings in place; returns whether anything changed.
@@ -277,6 +343,47 @@ mod tests {
     fn a_foreign_scheme_is_not_read() {
         assert_eq!(try_unseal("keychain:AAAAAAAA"), None);
         assert_eq!(try_unseal("dpapi:AAAA"), None);
+    }
+
+    #[test]
+    fn keychain_creates_a_key_only_when_none_exists() {
+        use keychain::{lookup, Lookup};
+        let key = [5u8; 32];
+        let encoded = format!("{}\n", STANDARD.encode(key));
+        assert_eq!(lookup(Some(0), encoded.as_bytes()), Lookup::Found(key));
+        assert_eq!(lookup(Some(44), b""), Lookup::Missing);
+        // Locked keychain, denied access, a killed `security`, a damaged value: never "missing",
+        // because a new key would replace the one existing values were sealed with.
+        assert_eq!(lookup(Some(51), b""), Lookup::Unavailable);
+        assert_eq!(lookup(Some(128), b""), Lookup::Unavailable);
+        assert_eq!(lookup(None, b""), Lookup::Unavailable);
+        assert_eq!(lookup(Some(0), b"not base64!"), Lookup::Unavailable);
+        assert_eq!(lookup(Some(0), STANDARD.encode([1u8; 16]).as_bytes()), Lookup::Unavailable);
+    }
+
+    #[test]
+    fn migration_waits_for_a_concurrent_settings_write() {
+        let dir = std::env::temp_dir().join(format!("hydra-secret-lock-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        std::fs::write(&path, r#"{"a":"plain:top"}"#).unwrap();
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let writer = {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                crate::settings::with_lock(&path, || {
+                    held_tx.send(()).unwrap();
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                    std::fs::write(&path, r#"{"a":"plain:top","written":"meanwhile"}"#).unwrap();
+                });
+            })
+        };
+        held_rx.recv().unwrap();
+        migrate_settings_file(&path);
+        writer.join().unwrap();
+        let value: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(value["written"], "meanwhile", "the migration must not overwrite a write it waited for");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
