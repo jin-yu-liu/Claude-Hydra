@@ -4,6 +4,14 @@ export const emptyNode = (): NodeConfig => ({
   kind: "socks5", host: "", port: 0, username: "", password: "", ipVersion: "ipv4", geoChannel: "ipinfo", refreshUrl: "",
 });
 
+/**
+ * A node as the backend sends it, with every field present. The backend leaves empty strings
+ * (username, password, refreshUrl) out of its JSON, while the form reads them as strings.
+ */
+export function normalizeNode(n: NodeConfig): NodeConfig {
+  return { ...emptyNode(), ...n, ...(n.via ? { via: normalizeNode(n.via) } : {}) };
+}
+
 const KINDS: Record<string, NodeKind> = { http: "http", https: "https", socks5: "socks5", socks5h: "socks5", socks: "socks5" };
 
 /**

@@ -1,5 +1,5 @@
 import type { Environment, EnvironmentInput } from "./api";
-import { fronts } from "./node";
+import { fronts, normalizeNode } from "./node";
 
 export const LOCALES: [string, string][] = [
   ["", "跟随系统"], ["en-US", "英语（美国）"], ["en-GB", "英语（英国）"],
@@ -34,5 +34,6 @@ export function environmentSummary(e: EnvironmentInput & { detectedTimezone?: st
 
 export function toInput(e: Environment): EnvironmentInput {
   const { name, node, timezone, locale, args, env, lastCheck, exitRule, allowCn, isolation, separateCode } = e;
-  return { clashSubscription: e.clashSubscription, name, node, timezone, locale, args, env, lastCheck: lastCheck ?? null, exitRule: exitRule ?? "", allowCn: !!allowCn, isolation: isolation ?? "", separateCode: !!separateCode };
+  const clashSubscription = e.clashSubscription && { ...e.clashSubscription, nodes: e.clashSubscription.nodes.map(normalizeNode) };
+  return { clashSubscription, name, node: node && normalizeNode(node), timezone, locale, args, env, lastCheck: lastCheck ?? null, exitRule: exitRule ?? "", allowCn: !!allowCn, isolation: isolation ?? "", separateCode: !!separateCode };
 }
