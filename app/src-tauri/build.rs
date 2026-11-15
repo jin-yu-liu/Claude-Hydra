@@ -1,4 +1,8 @@
 fn main() {
+    // Declared on every target: the code names these cfgs everywhere, only Windows sets them.
+    for guard in &GUARDS {
+        println!("cargo:rustc-check-cfg=cfg({})", guard.cfg32);
+    }
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         println!("cargo:rerun-if-changed=src/taskbar.cpp");
         cc::Build::new().cpp(true).file("src/taskbar.cpp").compile("hydra_taskbar");
@@ -65,7 +69,6 @@ fn build_guards() {
         && std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("x86_64");
     for guard in &GUARDS {
         println!("cargo:rerun-if-changed=src/{}", guard.source);
-        println!("cargo:rustc-check-cfg=cfg({})", guard.cfg32);
     }
     if !msvc_x64 { return; }
     let out = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap());
