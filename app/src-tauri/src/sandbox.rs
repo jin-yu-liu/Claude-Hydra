@@ -163,7 +163,9 @@ fn set_injection(dir: &Path, name: &str, key: &str, guards: &[Option<PathBuf>]) 
     Ok(())
 }
 
-/// Unreachable off Windows: `configure` stops at `available()` first.
+/// Never called off Windows: macOS launches through `macos::configure` (the Sandboxie
+/// `configure` is only reached from the non-macOS launcher), and on other systems `configure`
+/// stops at `available()` first.
 #[cfg(not(windows))]
 fn set_injection(_dir: &Path, _name: &str, _key: &str, _guards: &[Option<PathBuf>]) -> Result<(), String> {
     Err("沙箱隔离目前只支持 Windows（Sandboxie-Plus）。".into())
@@ -285,9 +287,6 @@ fn install_dir() -> Option<PathBuf> {
         .chain(["Sandboxie-Plus", "Sandboxie"].map(|d| Path::new(&program_files).join(d)))
         .find(|d| d.join("Start.exe").is_file() && d.join("SbieIni.exe").is_file())
 }
-
-#[cfg(not(windows))]
-fn install_dir() -> Option<PathBuf> { None }
 
 /// The isolation layer available on this system, or a user-facing reason it cannot be used.
 pub fn available() -> Result<PathBuf, String> {

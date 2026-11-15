@@ -14,6 +14,8 @@
 //! and falls back to `plain:` (with a log line) when the Keychain cannot be used, so a Mac without
 //! a usable login keychain still keeps its passwords rather than losing them.
 
+// `Engine` is used by the DPAPI path and the tests; macOS and other builds only need `STANDARD`.
+#[cfg_attr(not(windows), allow(unused_imports))]
 use base64::{engine::general_purpose::STANDARD, Engine};
 
 /// Seals a secret for `settings.json`.
