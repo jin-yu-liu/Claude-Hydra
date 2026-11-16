@@ -125,11 +125,12 @@ function Library({ account, profiles, select }: { account: Profile; profiles: Pr
       if (!list.length) return null;
       const folded = collapsed.has(path) && !needle;
       return <section key={path} className="list-card">
-        <div className="flex items-center gap-2 bg-card-2 px-3 py-2">
-          <button className="flex min-w-0 flex-1 items-center gap-2 text-left" aria-expanded={!folded} onClick={() => {
+        {/* The fold button carries the row's padding, so the whole header left of "迁移整组" is its hit area. */}
+        <div className="flex items-center gap-2 bg-card-2 pr-3">
+          <button className="flex min-w-0 flex-1 items-center gap-2 rounded-[inherit] py-2 pl-3 text-left" aria-expanded={!folded} onClick={() => {
             const next = new Set(collapsed); if (next.has(path)) next.delete(path); else next.add(path); setCollapsed(next);
           }}>
-            <ChevronDown className={`h-3 w-3 shrink-0 ${folded ? "-rotate-90" : ""}`} /><Folder className="h-4 w-4 shrink-0 text-muted" />
+            <ChevronDown className={`h-4 w-4 shrink-0 text-fg-2 ${folded ? "-rotate-90" : ""}`} /><Folder className="h-4 w-4 shrink-0 text-muted" />
             <span className="min-w-0"><strong className="block truncate text-sm">{leaf(path)}</strong>
               <span className="block truncate text-xs text-muted" title={path}>{path !== leaf(path) ? path + " · " : ""}{all.length} 个会话</span></span>
           </button>

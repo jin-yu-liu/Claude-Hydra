@@ -20,7 +20,7 @@ export function AboutPage({ info }: { info: AppInfo | null }) {
           <div className="mt-3 text-[17px] font-semibold tracking-[-0.01em]">Claude-Hydra</div>
           <div className="mt-0.5 text-[13px] text-muted">同时运行多个 Claude 桌面端账号</div>
           <div className="mt-2.5 inline-flex h-[22px] items-center rounded-full bg-card px-2.5 font-mono text-[11px] text-fg-2 shadow-card">
-            v1.0.0 · {info?.platform ?? ""}
+            {info ? `v${info.version} · ${info.platform}` : "…"}
           </div>
         </div>
 
