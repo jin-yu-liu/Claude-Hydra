@@ -17,6 +17,11 @@
  * `HydraRelayPort`) or when the listening socket belongs to a process in the same box, so host
  * services such as a local system proxy stay out of reach. ConnectEx (used by Node, Bun and
  * other IOCP runtimes) is wrapped through WSAIoctl so it gets the same checks.
+ *
+ * Direct boxes: an environment without a node has no relay and no network rules
+ * (`HydraDirect=y`, no `HydraRelayPort`). The guard then hooks nothing, so names resolve and
+ * connections leave as they would outside the box. Only that explicit setting turns it off: a
+ * box whose settings cannot be read keeps every check.
  */
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -72,6 +77,7 @@ static P_QueryProcess query_process;
 static P_GetExtendedTable get_tcp_table, get_udp_table;
 static WCHAR own_box[34];
 static USHORT relay_port; /* host byte order; 0 = no relay, loopback left unrestricted */
+static BOOL direct_box;  /* `HydraDirect=y`: no node, the guard stays out of the way */
 
 /* Whether `name` is the DNS client endpoint (`...\DNSResolver`, any case). */
 static BOOL is_dns_port(const UNICODE_STRING *name) {
@@ -272,9 +278,9 @@ static int WSAAPI my_WSAIoctl(SOCKET s, DWORD code, LPVOID in, DWORD in_len, LPV
     return rc;
 }
 
-/* Reads this box's name and its `HydraRelayPort` setting. */
+/* Reads this box's name and its `HydraDirect` and `HydraRelayPort` settings. */
 static void load_box_settings(HMODULE sbie) {
-    WCHAR image[96], sid[96], value[16] = {0};
+    WCHAR image[96], sid[96], value[16] = {0}, direct[4] = {0};
     ULONG session = 0, port = 0;
     int i;
     P_QueryConf query_conf = (P_QueryConf)GetProcAddress(sbie, "SbieApi_QueryConf");
@@ -283,9 +289,15 @@ static void load_box_settings(HMODULE sbie) {
         own_box[0] = 0;
         return;
     }
-    if (!query_conf || query_conf(own_box, L"HydraRelayPort", 0, value, sizeof(value)) != 0) return;
-    for (i = 0; value[i] >= L'0' && value[i] <= L'9'; i++) port = port * 10 + (value[i] - L'0');
-    if (port > 0 && port < 65536 && value[i] == 0) relay_port = (USHORT)port;
+    if (!query_conf) return;
+    if (query_conf(own_box, L"HydraRelayPort", 0, value, sizeof(value)) == 0) {
+        for (i = 0; value[i] >= L'0' && value[i] <= L'9'; i++) port = port * 10 + (value[i] - L'0');
+        if (port > 0 && port < 65536 && value[i] == 0) relay_port = (USHORT)port;
+    }
+    /* A relay always wins: a leftover `HydraDirect` must never open a box that has one. */
+    if (!relay_port && query_conf(own_box, L"HydraDirect", 0, direct, sizeof(direct)) == 0 &&
+        (direct[0] == L'y' || direct[0] == L'Y') && direct[1] == 0)
+        direct_box = TRUE;
 }
 
 static void hook(P_SbieDll_Hook sbie_hook, HMODULE module, HMODULE self, const char *name, void *detour, void **sys) {
@@ -303,11 +315,12 @@ __declspec(dllexport) void __stdcall InjectDllMain(HINSTANCE sbie, ULONG_PTR unu
     if (!sbie_hook || !ntdll) return;
     GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                        (LPCWSTR)(void *)&InjectDllMain, &self);
+    load_box_settings((HMODULE)sbie);
+    if (direct_box) return;
     hook(sbie_hook, ntdll, self, "NtAlpcConnectPort", (void *)my_NtAlpcConnectPort, (void **)&sys_NtAlpcConnectPort);
     hook(sbie_hook, ntdll, self, "NtAlpcConnectPortEx", (void *)my_NtAlpcConnectPortEx, (void **)&sys_NtAlpcConnectPortEx);
     hook(sbie_hook, ntdll, self, "NtConnectPort", (void *)my_NtConnectPort, (void **)&sys_NtConnectPort);
     if (!ws2) return;
-    load_box_settings((HMODULE)sbie);
     if (relay_port) {
         HMODULE iphlp = LoadLibraryW(L"iphlpapi.dll");
         if (iphlp) {

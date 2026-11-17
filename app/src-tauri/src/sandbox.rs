@@ -18,7 +18,8 @@
 //! Hostname lookups in a box are normally handed to the Windows DNS client outside the box,
 //! which settings cannot close. Every box therefore loads Hydra's DNS guard (`dnsguard.c`,
 //! `InjectDll64`), which refuses that endpoint: external names then fail inside the box, while
-//! Claude itself sends host names to its relay.
+//! Claude itself sends host names to its relay. A box without a node (`HydraDirect=y`) has no
+//! relay and no network rules, and the guard leaves its network alone.
 //!
 //! A box virtualizes files and the registry, not what the system reports about itself, so every
 //! box also carries the identity guard (`idguard.c`, same `InjectDll`) answering the machine GUID,
@@ -414,10 +415,15 @@ pub fn configure(id: &str, data_dir: &str, #[cfg_attr(not(windows), allow(unused
             let loopback = if guard.is_some() && guard32.is_some() { "*,Allow;Address=127.0.0.1".to_string() } else { format!("*,Allow;Address=127.0.0.1;Port={port}") };
             append("NetworkAccess", &loopback)?;
             set("HydraRelayPort", &port.to_string())?;
+            let _ = set("HydraDirect", "");
         }
         None => {
+            // No node: no rules, and the DNS guard must not refuse external names and
+            // addresses either, or every process that resolves on its own (Claude Code, git)
+            // has no network at all. It stays loaded (the launch check expects it) but inert.
             let _ = set("NetworkAccess", "");
             let _ = set("HydraRelayPort", "");
+            set("HydraDirect", "y")?;
         }
     }
     let mut reload = Command::new(dir.join("Start.exe"));
@@ -1002,6 +1008,48 @@ if ($needed -gt 0) {
         }
         assert!(udd.join("Local State").is_file() || udd.join("logs").is_dir(), "profile data did not reach the real folder");
         println!("claude log net lines: {}", log.lines().filter(|l| l.contains("net::") || l.contains("proxy")).take(4).collect::<Vec<_>>().join(" | "));
+    }
+
+    /// A box without a node has no relay: names must resolve and external hosts must be reachable
+    /// in it, as outside it (the guard stays loaded but inert). Then the same box with a relay
+    /// must be closed again, so the switch does not stick.
+    /// `CLAUDE_HYDRA_ROOT=<scratch> cargo test --lib sandboxie_direct_box -- --ignored --nocapture`
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires Sandboxie-Plus, network and CLAUDE_HYDRA_ROOT pointing to a scratch folder"]
+    fn sandboxie_direct_box_has_network() {
+        use std::time::{Duration, Instant};
+        assert!(std::env::var_os("CLAUDE_HYDRA_ROOT").is_some(), "set CLAUDE_HYDRA_ROOT to a scratch folder");
+        let id = "hydra-direct-test";
+        let data = crate::paths::storage_root().join("direct-data");
+        let _ = std::fs::remove_dir_all(&data);
+        std::fs::create_dir_all(&data).unwrap();
+        let ps = std::path::PathBuf::from(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe");
+        let probe = |round: &str| -> String {
+            let out = data.join(format!("net-{round}.txt"));
+            let script = format!(
+                "$r=@(); try{{ $a=[Net.Dns]::GetHostAddresses('www.microsoft.com'); $r+='dns=resolved' }}catch{{ $r+='dns=failed' }}; try{{ $c=New-Object Net.Sockets.TcpClient; $c.Connect('www.microsoft.com',443); $c.Close(); $r+='tcp=open' }}catch{{ $r+='tcp=blocked' }}; $r -join ' ' | Set-Content -Encoding ascii '{}'",
+                out.display()
+            );
+            let file = data.join(format!("probe-{round}.ps1"));
+            std::fs::write(&file, script).unwrap();
+            super::command(id, &ps, &format!("-NoProfile -ExecutionPolicy Bypass -File \"{}\"", file.display()), &[]).unwrap().spawn().unwrap();
+            let started = Instant::now();
+            while !out.is_file() && started.elapsed() < Duration::from_secs(60) { std::thread::sleep(Duration::from_millis(300)); }
+            std::fs::read_to_string(&out).expect("boxed probe wrote no result")
+        };
+        let terminate = |name: &str| { let _ = std::process::Command::new(super::available().unwrap().join("Start.exe")).args([&format!("/box:{name}"), "/silent", "/terminate"]).status(); };
+        let name = super::configure(id, &data.to_string_lossy(), &[data.join("claude-code-sessions")], None).unwrap();
+        let direct = probe("direct");
+        println!("direct: {}", direct.trim());
+        terminate(&name);
+        let relay = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        super::configure(id, &data.to_string_lossy(), &[data.join("claude-code-sessions")], Some(relay.local_addr().unwrap().port())).unwrap();
+        let relayed = probe("relay");
+        println!("relay: {}", relayed.trim());
+        terminate(&name);
+        assert!(direct.contains("dns=resolved") && direct.contains("tcp=open"), "a box without a node must keep its network: {direct}");
+        assert!(relayed.contains("dns=failed") && relayed.contains("tcp=blocked"), "a box with a relay must stay closed: {relayed}");
     }
 
     /// Real Sandboxie-Plus check of the identifiers: `CLAUDE_HYDRA_ROOT=<scratch> cargo test --lib
