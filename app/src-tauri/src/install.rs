@@ -69,7 +69,7 @@ impl Install {
                 }
             }
             let a = apps.join("claude-desktop.exe");
-            return a.exists().then_some(a);
+            return a.exists().then_some(a).or_else(|| self.exe.clone());
         }
         self.exe.clone()
     }
@@ -174,13 +174,14 @@ fn classic(exe: PathBuf) -> Install {
 fn msix(family: &str, version: Option<String>, exe: Option<PathBuf>) -> Option<Install> {
     let lad = local_app_data()?;
     let pkg = lad.join("Packages").join(family);
-    if !pkg.is_dir() {
+    let exe = exe.filter(|e| e.is_file());
+    if exe.is_none() && !pkg.is_dir() {
         return None;
     }
     let candidates = default_candidates(Some(&pkg));
     Some(Install {
         kind: "Msix".into(),
-        exe: exe.filter(|e| e.exists()),
+        exe,
         version,
         family: Some(family.to_string()),
         aumid: Some(format!("{family}!Claude")),
@@ -214,7 +215,41 @@ fn from_user_path(p: PathBuf) -> Install {
     if let Some(app) = mac_bundle(&p) {
         return mac_app(app);
     }
+    #[cfg(windows)]
+    if let Some(i) = manual_store(&p) {
+        return i;
+    }
     classic(p)
+}
+
+#[cfg(windows)]
+fn manual_store(p: &Path) -> Option<Install> {
+    let named = |path: &Path, name: &str| {
+        path.file_name().and_then(|s| s.to_str()).is_some_and(|s| s.eq_ignore_ascii_case(name))
+    };
+    let parent = p.parent()?;
+    if named(p, "claude-desktop.exe") {
+        let aliases = local_app_data()?.join(r"Microsoft\WindowsApps");
+        let same = |path: &Path| path.components().map(|c| c.as_os_str().to_ascii_lowercase())
+            .eq(aliases.components().map(|c| c.as_os_str().to_ascii_lowercase()));
+        if same(parent) { return installed_store(); }
+        if same(parent.parent()?) {
+            let family = parent.file_name()?.to_str()?;
+            let (name, publisher) = family.split_once('_')?;
+            if name.eq_ignore_ascii_case("Claude") && !publisher.is_empty() && !publisher.contains('_') {
+                return msix(family, None, None);
+            }
+        }
+        return None;
+    }
+    let package = parent.parent()?;
+    if !named(p, "Claude.exe") || !named(parent, "app") || !named(package.parent()?, "WindowsApps") {
+        return None;
+    }
+    let parts: Vec<_> = package.file_name()?.to_str()?.split('_').collect();
+    let [name, version, _, _, publisher] = parts.as_slice() else { return None };
+    if !name.eq_ignore_ascii_case("Claude") || publisher.is_empty() { return None; }
+    msix(&format!("{name}_{publisher}"), Some(version.to_string()), Some(p.to_owned()))
 }
 
 /// The `.app` bundle that is `p` or contains it.
@@ -247,7 +282,7 @@ fn from_cache(s: &Settings) -> Option<Install> {
 }
 
 #[cfg(windows)]
-fn search() -> Result<Install, String> {
+fn installed_store() -> Option<Install> {
     if let Some(lad) = local_app_data() {
         if let Ok(rd) = std::fs::read_dir(lad.join("Packages")) {
             for e in rd.flatten() {
@@ -255,13 +290,19 @@ fn search() -> Result<Install, String> {
                 if name.starts_with("Claude_") && !name[7..].contains('_') {
                     if let Some(i) = msix(&name, None, None) {
                         if i.launch_exe().is_some() {
-                            return Ok(i);
+                            return Some(i);
                         }
                     }
                 }
             }
         }
     }
+    None
+}
+
+#[cfg(windows)]
+fn search() -> Result<Install, String> {
+    if let Some(i) = installed_store() { return Ok(i); }
     let mut dirs: Vec<PathBuf> = Vec::new();
     if let Some(lad) = local_app_data() {
         dirs.push(lad.join("AnthropicClaude"));
@@ -338,6 +379,37 @@ mod tests {
             aumid: None,
             default_profile: PathBuf::new(),
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires a locally installed Store build and enabled execution aliases"]
+    fn installed_store_manual_paths_resolve_to_same_package() {
+        let detected = installed_store().unwrap();
+        let family = detected.family.as_deref().unwrap();
+        let aliases = local_app_data().unwrap().join(r"Microsoft\WindowsApps");
+        for alias in [aliases.join("claude-desktop.exe"), aliases.join(family).join("claude-desktop.exe")] {
+            assert!(alias.exists());
+            let resolved = from_user_path(alias);
+            assert_eq!(resolved.family, detected.family);
+            assert!(resolved.exe.is_none());
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn manual_store_package_keeps_identity() {
+        let root = std::env::temp_dir().join(format!("hydra-install-{}", crate::paths::now_millis()));
+        let exe = root.join(r"WindowsApps\Claude_4.1.0.0_x64__pzs8sxrjxfjjc\App\CLAUDE.EXE");
+        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        std::fs::write(&exe, []).unwrap();
+        let i = from_user_path(exe.clone());
+        assert!(i.is_msix());
+        assert_eq!(i.exe.as_ref(), Some(&exe));
+        assert_eq!(i.family.as_deref(), Some("Claude_pzs8sxrjxfjjc"));
+        assert_eq!(i.version.as_deref(), Some("4.1.0.0"));
+        assert!(!from_user_path(PathBuf::from(r"D:\Programs\Claude\Claude.exe")).is_msix());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
