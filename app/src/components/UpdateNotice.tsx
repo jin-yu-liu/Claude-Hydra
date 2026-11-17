@@ -1,7 +1,7 @@
 import { getIdentifier, getVersion } from "@tauri-apps/api/app";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import { ArrowDownToLine, Check, Loader2, X } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { api, errorText, type ReleaseNote } from "@/lib/api";
 import { isNewer } from "@/lib/releaseNotes";
 import { ReleaseNotes } from "./ReleaseNotes";
@@ -43,22 +43,35 @@ export function UpdateNotice() {
   const [notes, setNotes] = useState<Notes>({ loading: false, list: [] });
   const [since, setSince] = useState("");
   const [phase, setPhase] = useState<Phase>({ kind: "idle" });
+  // The update being offered, and whether it is being installed (then it must not be swapped).
+  const found = useRef<Update | null>(null);
+  const installing = useRef(false);
+  const pending = useRef<Promise<Update | null> | null>(null);
+  const checkedAt = useRef(0);
+
+  /** Ask the feed again: a release published while Hydra runs replaces an older offer, so a
+   *  long-running Hydra never installs a superseded version (the feed always serves the newest). */
+  const poll = (force = false) => {
+    if (!force && Date.now() - checkedAt.current < 10 * 60 * 1000) return Promise.resolve(found.current);
+    return pending.current ??= (async () => {
+      try {
+        checkedAt.current = Date.now();
+        if (await getIdentifier() !== "local.claude-hydra") return found.current;
+        const result = await check({ timeout: 15000 });
+        const current = found.current;
+        if (result && !installing.current && (!current || isNewer(result.version, current.version))) {
+          found.current = result;
+          setUpdate(result);
+          await current?.close();
+        } else await result?.close();
+      } catch { /* Offline or no published release; retry on the next interval or focus. */ }
+      finally { pending.current = null; }
+      return found.current;
+    })();
+  };
 
   useEffect(() => {
-    let active = true, pending = false;
-    let found: Update | null = null;
-    async function poll() {
-      if (pending || found) return;
-      pending = true;
-      try {
-        if (await getIdentifier() !== "local.claude-hydra") return;
-        const result = await check({ timeout: 15000 });
-        if (!active) { await result?.close(); return; }
-        found = result;
-        setUpdate(result);
-      } catch { /* Offline or no published release; retry on the next interval or focus. */ }
-      finally { pending = false; }
-    }
+    let active = true;
     // First launch after an update: show what changed, once.
     void (async () => {
       const version = await getVersion();
@@ -74,11 +87,11 @@ export function UpdateNotice() {
         if (active) setNotes({ loading: false, list });
       }
     })();
-    void poll();
-    const timer = window.setInterval(poll, 60 * 60 * 1000);
+    void poll(true);
+    const timer = window.setInterval(() => void poll(true), 60 * 60 * 1000);
     const onFocus = () => void poll();
     window.addEventListener("focus", onFocus);
-    return () => { active = false; window.clearInterval(timer); window.removeEventListener("focus", onFocus); void found?.close(); };
+    return () => { active = false; window.clearInterval(timer); window.removeEventListener("focus", onFocus); void found.current?.close(); found.current = null; };
   }, []);
 
   const ask = async () => {
@@ -87,11 +100,15 @@ export function UpdateNotice() {
     setOpen("ask");
     if (phase.kind === "error") setPhase({ kind: "idle" });
     setNotes({ loading: true, list: [] });
-    const fallback = { version: update.version, date: update.date ?? "", body: update.body ?? "" };
-    setNotes({ loading: false, list: await loadNotes(update.currentVersion, update.version, fallback) });
+    // Offer the newest release, not whichever one was current when the pill appeared.
+    const latest = await poll(true) ?? update;
+    setSince(latest.currentVersion);
+    const fallback = { version: latest.version, date: latest.date ?? "", body: latest.body ?? "" };
+    setNotes({ loading: false, list: await loadNotes(latest.currentVersion, latest.version, fallback) });
   };
   const install = async () => {
     if (!update) return;
+    installing.current = true;
     setPhase({ kind: "downloading", done: 0, total: 0 });
     try {
       let done = 0, total = 0;
@@ -101,7 +118,7 @@ export function UpdateNotice() {
         setPhase({ kind: "downloading", done, total });
       });
       setPhase({ kind: "ready" });
-    } catch (e) { setPhase({ kind: "error", message: errorText(e) }); }
+    } catch (e) { setPhase({ kind: "error", message: errorText(e) }); installing.current = false; }
   };
   const dismiss = () => { if (update) { store.set(DISMISSED, update.version); setDismissed(update.version); } };
   const busy = phase.kind === "downloading";
