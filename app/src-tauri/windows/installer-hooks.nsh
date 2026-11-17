@@ -29,6 +29,12 @@ FunctionEnd
 
 !macro NSIS_HOOK_PREINSTALL
   Push $0
+  ; The bundled proxy core can outlive the app, and a running exe cannot be overwritten
+  ; ("Error opening file for writing: ...\mihomo.exe"). Stop only the copy installed here,
+  ; never a mihomo the user runs from somewhere else.
+  DetailPrint "正在停止旧版本的代理核心…"
+  nsExec::ExecToLog `"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "Get-Process mihomo -ErrorAction SilentlyContinue | Where-Object { $$_.Path -and $$_.Path.StartsWith('$INSTDIR\', [StringComparison]::OrdinalIgnoreCase) } | Stop-Process -Force -ErrorAction SilentlyContinue; Start-Sleep -Milliseconds 500"`
+  Pop $0 ; exit code, ignored: nothing to stop is fine
   Call HydraFindSandboxie
   Pop $0
   ${If} $0 == 0
