@@ -189,11 +189,18 @@ fn msix(family: &str, version: Option<String>, exe: Option<PathBuf>) -> Option<I
     })
 }
 
+pub(crate) fn valid_program_path(path: &Path) -> bool {
+    #[cfg(windows)]
+    { path.is_file() && path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("exe")) }
+    #[cfg(not(windows))]
+    { path.exists() }
+}
+
 pub fn resolve() -> Result<Install, String> {
     let s = settings::load();
     if let Some(p) = s.claude_path.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
         let p = PathBuf::from(p);
-        if p.exists() {
+        if valid_program_path(&p) {
             return Ok(from_user_path(p));
         }
     }
@@ -278,7 +285,7 @@ fn from_cache(s: &Settings) -> Option<Install> {
         return msix(family, c.version.clone(), exe);
     }
     let exe = exe?;
-    exe.exists().then(|| from_user_path(exe))
+    valid_program_path(&exe).then(|| from_user_path(exe))
 }
 
 #[cfg(windows)]

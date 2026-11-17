@@ -480,6 +480,9 @@ fn set_claude_path(app: AppHandle, path: Option<String>) -> Result<(), String> {
         if !std::path::Path::new(p).exists() {
             return Err(format!("路径不存在：{p}"));
         }
+        if !install::valid_program_path(std::path::Path::new(p)) {
+            return Err("请选择 Claude 的 .exe 程序文件，或留空以自动查找。".into());
+        }
     }
     settings::update(|s| {
         s.claude_path = path.clone();

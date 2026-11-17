@@ -43,14 +43,37 @@ pub struct TransferResult { copied: usize, skipped: usize, failed: usize }
 
 struct Entry { session: Session, path: PathBuf, account: String, org: String }
 
-fn root(install: &Install, p: &Profile) -> PathBuf {
+pub(crate) fn root(install: &Install, p: &Profile) -> PathBuf {
+    #[cfg(windows)]
+    if p.is_default && install.is_msix() {
+        if let (Some(local), Some(family)) = (std::env::var_os("LOCALAPPDATA"), install.family.as_deref()) {
+            if let Some(root) = packaged_session_root(Path::new(&local), family) {
+                return root;
+            }
+        }
+    }
     install.data_dir(Path::new(&p.path)).join("claude-code-sessions")
 }
 
+#[cfg(windows)]
+fn packaged_session_root(local: &Path, family: &str) -> Option<PathBuf> {
+    let root = local.join("Claude-Data").join(family).join("claude-code-sessions");
+    // An identity directory remains in place when its last index goes to the recycle bin.
+    match stores(&root) {
+        Ok(stores) if stores.is_empty() => None,
+        // Keep an inaccessible root so the session operation reports the read error.
+        _ => Some(root),
+    }
+}
+
 fn dirs(path: &Path) -> Result<Vec<PathBuf>, String> {
-    if !path.exists() { return Ok(Vec::new()); }
+    let listing = match fs::read_dir(path) {
+        Ok(listing) => listing,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("无法读取会话目录 {}：{e}", path.display())),
+    };
     let mut out = Vec::new();
-    for e in fs::read_dir(path).map_err(|_| "无法读取会话目录。")? {
+    for e in listing {
         let e = e.map_err(|_| "无法读取会话目录。")?;
         if e.file_type().map_err(|_| "无法读取会话目录。")?.is_dir() { out.push(e.path()); }
     }
@@ -67,9 +90,9 @@ fn stores(path: &Path) -> Result<Vec<PathBuf>, String> {
 /// Restore only transcripts named by this Desktop profile when switching Code directories.
 /// Keep project names intact: Desktop uses them to resolve the transcript for a working folder.
 #[cfg(windows)]
-pub(crate) fn recover_projects(profile: &Path, code: &Path, old_roots: &[PathBuf]) -> Result<(), String> {
+pub(crate) fn recover_projects(session_root: &Path, code: &Path, old_roots: &[PathBuf]) -> Result<(), String> {
     use std::collections::HashSet;
-    let entries = collect(&profile.join("claude-code-sessions"))?;
+    let entries = collect(session_root)?;
     let ids: HashSet<_> = entries.into_iter().filter_map(|e| e.session.transcript_id)
         .filter(|id| uuid::Uuid::parse_str(id).is_ok()).collect();
     if ids.is_empty() { return Ok(()); }
@@ -172,10 +195,9 @@ fn is_running(install: &Install, profiles: &[&Profile]) -> bool {
 // Imported chats belong to the selected Hydra profile. Keep them outside Claude's
 // native index directory so Desktop never tries to open an export as a Code session.
 fn library(install: &Install, p: &Profile, trash: bool, imported: bool) -> PathBuf {
-    let native = root(install, p);
-    if !trash && !imported { return native; }
+    if !trash && !imported { return root(install, p); }
     let kind = if imported { "chats" } else { "code" };
-    native.with_file_name("hydra-session-library").join(if trash { "trash" } else { "active" }).join(kind)
+    install.data_dir(Path::new(&p.path)).join("hydra-session-library").join(if trash { "trash" } else { "active" }).join(kind)
 }
 
 fn entries(install: &Install, p: &Profile, trash: bool) -> Result<Vec<Entry>, String> {
@@ -419,6 +441,20 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn store_sessions_use_the_registered_package_family() {
+        let local = temp("family-sessions");
+        let family = "Claude_pzs8sxrjxfjjc";
+        let root = local.join("Claude-Data").join(family).join("claude-code-sessions");
+        let store = store_dir(&root, "user", "org").unwrap();
+        fs::write(store.join("local_example.json"), "{}").unwrap();
+        assert_eq!(collect(&packaged_session_root(&local, family).unwrap()).unwrap().len(), 1);
+        assert!(packaged_session_root(&local, "Claude_other").is_none());
+        assert!(!crate::install::valid_program_path(&root));
+        fs::remove_dir_all(local).unwrap();
+    }
+
     #[test]
     fn replacement_is_limited_to_complete_json_values() {
         let mut v = serde_json::json!({"account":"a", "nested":["org-a", "path/a/org-a"], "a":"a"});
@@ -460,7 +496,7 @@ mod tests {
         fs::write(project.join(&name), b"original").unwrap();
         fs::write(project.join(&id).join("attachment"), b"sidecar").unwrap();
         fs::write(project.join("other.jsonl"), b"unrelated").unwrap();
-        let restore = || recover_projects(&root, &code, std::slice::from_ref(&source)).unwrap();
+        let restore = || recover_projects(&root.join("claude-code-sessions"), &code, std::slice::from_ref(&source)).unwrap();
         restore();
         let target = code.join("projects/project");
         assert_eq!(fs::read(target.join(&name)).unwrap(), b"original");

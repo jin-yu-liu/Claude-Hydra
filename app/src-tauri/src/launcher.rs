@@ -193,7 +193,7 @@ pub fn launch(install: &Install, p: &Profile) -> Result<&'static str, String> {
             line.push(extra);
         }
         let mut cmd = if sandboxed {
-            crate::sandbox::configure(&p.id, &p.path, relay_port).map_err(|e| format!("账号未启动：{e}"))?;
+            crate::sandbox::configure(&p.id, &p.path, &crate::sessions::root(install, p), relay_port).map_err(|e| format!("账号未启动：{e}"))?;
             crate::sandbox::command(&p.id, &exe, &line.join(" "), &env)?
         } else {
             let mut cmd = Command::new(&exe);
