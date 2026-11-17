@@ -16,8 +16,9 @@
  *   - registry values: NtQueryValueKey / NtEnumerateValueKey (RegQueryValueExW/A, RegGetValueW/A,
  *     RegEnumValueW/A, and anything else reading the value);
  *   - volume serials: NtQueryVolumeInformationFile (GetVolumeInformationW/A, ...ByHandleW,
- *     GetFileInformationByHandle, Node's fs.stat().dev) and NtQueryInformationFile
- *     (FileIdInformation, the 64-bit serial);
+ *     GetFileInformationByHandle, Node's fs.fstat().dev), NtQueryInformationFile and
+ *     NtQueryInformationByName (FileIdInformation's 64-bit serial, and FileStatBasicInformation,
+ *     which Node's fs.stat() reads by path on Windows 11 24H2+);
  *   - the computer name: GetComputerNameW/A, GetComputerNameExW/A, and the `Hostname` value
  *     `hostname.exe` prints;
  *   - the account: GetUserNameW/A, GetUserNameExW/A, LookupAccountSidW/A, LookupAccountNameW/A
@@ -66,6 +67,7 @@ typedef NTSTATUS(NTAPI *P_NtEnumerateValueKey)(HANDLE, ULONG, ULONG, PVOID, ULON
 typedef NTSTATUS(NTAPI *P_NtQueryKey)(HANDLE, ULONG, PVOID, ULONG, PULONG);
 typedef NTSTATUS(NTAPI *P_NtQueryVolumeInformationFile)(HANDLE, PIO_STATUS_BLOCK, PVOID, ULONG, ULONG);
 typedef NTSTATUS(NTAPI *P_NtQueryInformationFile)(HANDLE, PIO_STATUS_BLOCK, PVOID, ULONG, ULONG);
+typedef NTSTATUS(NTAPI *P_NtQueryInformationByName)(POBJECT_ATTRIBUTES, PIO_STATUS_BLOCK, PVOID, ULONG, ULONG);
 typedef ULONG(WINAPI *P_GetAdaptersAddresses)(ULONG, ULONG, PVOID, PIP_ADAPTER_ADDRESSES, PULONG);
 typedef ULONG(WINAPI *P_GetAdaptersInfo)(PIP_ADAPTER_INFO, PULONG);
 typedef DWORD(WINAPI *P_GetIfTable)(PMIB_IFTABLE, PULONG, BOOL);
@@ -141,6 +143,7 @@ static P_NtQueryKey sys_NtQueryKey;
 static P_RtlPcToFileHeader sys_RtlPcToFileHeader;
 static P_NtQueryVolumeInformationFile sys_NtQueryVolumeInformationFile;
 static P_NtQueryInformationFile sys_NtQueryInformationFile;
+static P_NtQueryInformationByName sys_NtQueryInformationByName;
 static P_GetAdaptersAddresses sys_GetAdaptersAddresses;
 static P_GetAdaptersInfo sys_GetAdaptersInfo;
 static P_GetIfTable sys_GetIfTable;
@@ -1057,14 +1060,36 @@ static NTSTATUS NTAPI my_NtQueryVolumeInformationFile(HANDLE file, PIO_STATUS_BL
     return status;
 }
 
+/* The file information classes that carry the volume's serial, rewritten the same way whether
+   the file was reached by handle or by name:
+     - FileIdInformation (59): the 64-bit VolumeSerialNumber comes first;
+     - FileStatBasicInformation (77, Windows 11 24H2+): VolumeSerialNumber at offset 80, the same
+       64-bit value FileIdInformation reports. GetFileInformationByName(FileStatBasicByNameInfo)
+       ends here through NtQueryInformationByName, and libuv's fs.stat() uses it when present while
+       fs.fstat() still asks FileFsVolumeInformation; both must agree or Node's same-file checks
+       (Claude's "link or placeholder" guard) see two different devices. */
+static void rewrite_file_serial(PVOID info, ULONG length, ULONG info_class) {
+    if (!info) return;
+    if (info_class == 59 && length >= 8) {
+        ULONGLONG *serial = (ULONGLONG *)info;
+        *serial = volume_serial64(*serial);
+    } else if (info_class == 77 && length >= 88) {
+        ULONGLONG *serial = (ULONGLONG *)((BYTE *)info + 80);
+        *serial = volume_serial64(*serial);
+    }
+}
+
 static NTSTATUS NTAPI my_NtQueryInformationFile(HANDLE file, PIO_STATUS_BLOCK io, PVOID info, ULONG length,
                                                 ULONG info_class) {
     NTSTATUS status = sys_NtQueryInformationFile(file, io, info, length, info_class);
-    /* FileIdInformation: the 64-bit VolumeSerialNumber comes first. */
-    if (info_class == 59 && info && length >= 8 && NT_SUCCESS(status)) {
-        ULONGLONG *serial = (ULONGLONG *)info;
-        *serial = volume_serial64(*serial);
-    }
+    if (NT_SUCCESS(status)) rewrite_file_serial(info, length, info_class);
+    return status;
+}
+
+static NTSTATUS NTAPI my_NtQueryInformationByName(POBJECT_ATTRIBUTES name, PIO_STATUS_BLOCK io, PVOID info,
+                                                  ULONG length, ULONG info_class) {
+    NTSTATUS status = sys_NtQueryInformationByName(name, io, info, length, info_class);
+    if (NT_SUCCESS(status)) rewrite_file_serial(info, length, info_class);
     return status;
 }
 
@@ -1764,6 +1789,9 @@ __declspec(dllexport) void __stdcall InjectDllMain(HINSTANCE sbie, ULONG_PTR unu
     if (have_volume_serial) {
         HOOK(ntdll, NtQueryVolumeInformationFile);
         HOOK(ntdll, NtQueryInformationFile);
+        /* Path-based queries (Windows 10 1703+; the stat class only on 11 24H2+). Absent on older
+           systems, where hook() simply finds no export. */
+        HOOK(ntdll, NtQueryInformationByName);
     }
     if (have_mac && iphlpapi) {
         HOOK(iphlpapi, GetAdaptersAddresses);

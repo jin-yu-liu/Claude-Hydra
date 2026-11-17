@@ -1051,7 +1051,7 @@ if ($needed -gt 0) {
                  echo HYDRA-WHOAMI\r\n\
                  whoami\r\n\
                  echo HYDRA-NODE\r\n\
-                 node -e \"const o=require('os'),f=require('fs');console.log('NODE-HOST='+o.hostname());console.log('NODE-DEV-C='+f.statSync('C:/').dev);console.log('NODE-DEV-D='+f.statSync('D:/').dev);console.log('NODE-USER='+o.userInfo().username);for(const l of Object.values(o.networkInterfaces()))for(const a of l)if(a.mac!=='00:00:00:00:00:00')console.log('NODE-MAC='+a.mac)\"\r\n\
+                 node -e \"const o=require('os'),f=require('fs');console.log('NODE-HOST='+o.hostname());console.log('NODE-DEV-C='+f.statSync('C:/').dev);console.log('NODE-DEV-D='+f.statSync('D:/').dev);console.log('NODE-DEV-PATH='+f.statSync(process.execPath).dev);console.log('NODE-DEV-HANDLE='+f.fstatSync(f.openSync(process.execPath,'r')).dev);console.log('NODE-USER='+o.userInfo().username);for(const l of Object.values(o.networkInterfaces()))for(const a of l)if(a.mac!=='00:00:00:00:00:00')console.log('NODE-MAC='+a.mac)\"\r\n\
                  echo HYDRA-ACCOUNT\r\n\
                  echo USERNAME=%USERNAME%\r\n\
                  echo USERDOMAIN=%USERDOMAIN%\r\n\
@@ -1156,6 +1156,10 @@ if ($needed -gt 0) {
             assert_eq!(value("NODE-HOST="), ids.computer_name, "os.hostname(): {node}");
             assert_eq!(value("NODE-DEV-C="), c_value.to_string(), "fs.stat('C:').dev: {node}");
             assert_eq!(value("NODE-DEV-D="), d_value.to_string(), "fs.stat('D:').dev: {node}");
+            // By path (NtQueryInformationByName on Windows 11 24H2+) and by handle must agree, or
+            // Node's same-file checks see two devices and Claude refuses to read session files.
+            assert!(!value("NODE-DEV-PATH=").is_empty(), "fs.stat(execPath).dev missing: {node}");
+            assert_eq!(value("NODE-DEV-PATH="), value("NODE-DEV-HANDLE="), "stat vs fstat dev: {node}");
             assert_eq!(value("NODE-USER="), ids.user_name, "os.userInfo().username: {node}");
             let prefix = format!("{}:{}:{}", &ids.mac[..2], &ids.mac[2..4], &ids.mac[4..6]);
             let node_macs: Vec<&str> = node.lines().filter_map(|l| l.trim().strip_prefix("NODE-MAC=")).collect();

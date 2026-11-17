@@ -57,7 +57,7 @@ macOS 没有 Sandboxie 的对等物：那边做到的是内核级网络强制（
 | 机器 ID（MachineGuid） | 裸小写 GUID | `NtQueryValueKey` / `NtEnumerateValueKey`，键尾 `\Microsoft\Cryptography` |
 | 硬件配置 ID（HwProfileGuid） | 带花括号大写 GUID | 同上，键尾 `\Hardware Profiles\0001` |
 | 主机名 | `DESKTOP-` 加 7 位大写字母数字 | `GetComputerName[Ex]W/A`；注册表 `Tcpip\Parameters\Hostname`（同上两个 NT 调用）；账号域名 `LookupAccountSidW/A`、`LookupAccountNameW/A`、`GetUserNameExW/A(NameSamCompatible)`；环境变量 `COMPUTERNAME`、`USERDOMAIN`、`USERDOMAIN_ROAMINGPROFILE`、`LOGONSERVER` |
-| 卷序列号 | 8 位十六进制，每个卷各一个 | `NtQueryVolumeInformationFile(FileFsVolumeInformation)` 与 `NtQueryInformationFile(FileIdInformation)` |
+| 卷序列号 | 8 位十六进制，每个卷各一个 | `NtQueryVolumeInformationFile(FileFsVolumeInformation)`；`NtQueryInformationFile` 与 `NtQueryInformationByName` 的 `FileIdInformation`(59) 和 `FileStatBasicInformation`(77) |
 | MAC 地址 | 本地管理、单播；前 3 字节按账号固定，后 3 字节按网卡 GUID 派生 | `GetAdaptersAddresses`、`GetAdaptersInfo`、`GetIfTable`、`GetIfEntry`、`GetIfTable2[Ex]`、`GetIfEntry2[Ex]` |
 | 账号名 | 小写字母开头、6 位 `[a-z0-9]` | `GetUserNameW/A`、`GetUserNameExW/A(NameSamCompatible)`、`LookupAccountSidW/A`（真 SID → 派生名）、`LookupAccountNameW/A`（派生名 → 派生 SID）；环境变量 `USERNAME` |
 | 账号 SID | `S-1-5-21-…-1001`（文本与二进制两种形式） | `ConvertSidToStringSidW/A`（真 SID 的文本 → 派生文本）、`LookupAccountSidW/A`（派生 SID → 派生名 + 派生域）、`LookupAccountNameW/A`（派生名 → 派生 SID）、`GetTokenInformation`（TokenUser 等 → 派生 SID）、`LsaLookupSids` / `LsaLookupSids2` / `LsaLookupNames2`（.NET 使用的 LSA 直接路径） |
@@ -78,6 +78,8 @@ macOS 没有 Sandboxie 的对等物：那边做到的是内核级网络强制（
 NT 层只知道"是哪个卷"，不知道调用方用的路径，所以派生值以该卷的**真实序列号**为键：`派生 = derive(账号键, 'V', 真实序列号)`。好处是所有通往同一卷的路都一致——盘符、`NULL`（当前盘）、挂在 `C:\mnt\data` 上的卷、打开的文件句柄——而且挂载点卷与 `C:` 自然分开。
 
 64 位卷号（`FileIdInformation`）的低 32 位与 `vol` 显示的值一致，高 32 位另行派生，与 NTFS 的实际关系相同。
+
+**按路径与按句柄必须一致（2026-11-16 修复）**：Windows 11 24H2 起，Node（libuv）的 `fs.stat()` 优先用 `GetFileInformationByName(FileStatBasicByNameInfo)` 按路径读取，底层是 `NtQueryInformationByName(FileStatBasicInformation)`，结果里偏移 80 处带 64 位卷号；`fs.fstat()` 仍按句柄走 `FileFsVolumeInformation`。原先只改写了句柄路线，同一个文件的 `stat().dev` 是主机真实值、`fstat().dev` 是派生值，Claude 读取会话文件时的"同一文件"校验失败，报"链接或占位符"。现在 `NtQueryInformationByName` 也被挂钩，类别 77 无论按路径还是按句柄都用 `volume_serial64` 改写，低 32 位与 `FileFsVolumeInformation` 的派生值相同。Win10 没有该类别，因此在 Win10 上的测试发现不了这个问题；集成测试新增了 `stat(execPath).dev == fstat(fd).dev` 的断言，需要在 24H2 以上的机器上运行才有意义。
 
 `derive` 是带账号键的 FNV-1a 加 murmur3 收尾混淆，Rust（`identity.rs::derive`）与 C（`idguard.c::derive`）逐字节一致。用带键的非线性混淆而不是"基值异或"，是因为异或方案下同一台机器上任何账号的 `serial(C) ^ serial(D)` 都相等，可以据此把账号串起来，甚至认出 Hydra 本身；单元测试 `volume_relations_do_not_link_accounts` 钉住这一点，`derive_matches_the_guard` 钉住一组在真实沙箱里观察到的值。
 
