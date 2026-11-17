@@ -12,7 +12,8 @@ type Action = { type: "move"; ids: string[] } | { type: "import" } | { type: "em
 const imported = (id: string) => id.startsWith("import/") && id.split("/").length === 4;
 const directory = (s: CodeSession) => imported(s.id) ? "导入的聊天" : s.cwd || "未记录工作目录";
 const leaf = (path: string) => path.split(/[\\/]/).filter(Boolean).pop() || path;
-const summary = (r: TransferResult) => `完成 ${r.copied} 条，已存在 ${r.skipped} 条，失败 ${r.failed} 条。`;
+const summary = (r: TransferResult) => `完成 ${r.copied} 条，` + (r.updated ? `更新到最新 ${r.updated} 条，` : "") + `已是最新 ${r.skipped} 条，失败 ${r.failed} 条。`
+  + (r.forked ? `另有 ${r.forked} 条在两个账号里都继续聊过，已作为新会话迁入（标题带“来自”），目标账号原来的对话保持不变。` : "");
 
 export function SessionsPage({ profiles }: { profiles: Profile[] | null }) {
   const [selected, setSelected] = useState("");

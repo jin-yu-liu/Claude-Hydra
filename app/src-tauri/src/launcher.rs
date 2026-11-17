@@ -9,6 +9,13 @@ use std::process::{Command, Stdio};
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
+/// The account's own Claude Code folder (`CLAUDE_CONFIG_DIR`), or `None` when it shares
+/// `~/.claude`. Session migration uses this to find where each account keeps transcripts.
+pub(crate) fn private_code_dir(effective: &settings::Effective, p: &Profile) -> Option<PathBuf> {
+    let sandboxed = effective.isolation == "sandboxie";
+    (effective.separate_code && (!p.is_default || sandboxed)).then(|| crate::sandbox::code_dir(&p.id))
+}
+
 pub fn launch(install: &Install, p: &Profile) -> Result<&'static str, String> {
     let running = profiles::running_map(install).get(&path_key(&p.path)).copied();
     if let Some(pid) = running {
@@ -94,7 +101,7 @@ pub fn launch(install: &Install, p: &Profile) -> Result<&'static str, String> {
     }
     // Claude Code started by this account keeps its sign-in, settings and sessions in the
     // account's own folder instead of the `~/.claude` every account shares.
-    let code_dir = (effective.separate_code && (!p.is_default || sandboxed)).then(|| crate::sandbox::code_dir(&p.id));
+    let code_dir = private_code_dir(&effective, p);
     if let Some(dir) = &code_dir {
         std::fs::create_dir_all(dir).map_err(|e| format!("账号未启动：无法创建 Claude Code 目录：{e}"))?;
         env.retain(|(k, _)| !k.eq_ignore_ascii_case("CLAUDE_CONFIG_DIR"));

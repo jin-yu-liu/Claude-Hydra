@@ -102,7 +102,7 @@ export interface CodeSession {
   id: string; title: string; cwd: string | null; cwdExists: boolean; lastActivityAt: number | null; model: string | null; turns: number | null; inTarget: boolean;
 }
 export interface SessionPreview { sessions: CodeSession[]; targetProblem: string | null; running: boolean }
-export interface TransferResult { copied: number; skipped: number; failed: number }
+export interface TransferResult { copied: number; skipped: number; failed: number; updated: number; forked: number }
 
 export const api = {
   listProfiles: () => invoke<Profile[]>("list_profiles"),

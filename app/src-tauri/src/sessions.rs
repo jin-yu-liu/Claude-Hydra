@@ -1,8 +1,11 @@
 //! Copy Desktop Claude Code session indexes between accounts.
 //!
-//! Only `claude-code-sessions/<account>/<org>/local_*.json` index files are copied; the
-//! transcripts themselves stay where Claude Code wrote them. Originals are never moved or
-//! overwritten. The source may keep running (indexes are only read, with a retry for a
+//! The `claude-code-sessions/<account>/<org>/local_*.json` index is copied, and when the two
+//! accounts keep separate Claude Code folders the transcript (`projects/*/<id>.jsonl`) goes
+//! with it: Desktop resumes a session from the transcript in the target's own folder. A target
+//! copy of either is replaced only when the source simply extends its transcript; a session
+//! both accounts continued arrives as a separate new session instead. Nothing the target wrote
+//! is lost, and originals are never moved. The source may keep running (indexes are only read, with a retry for a
 //! half-written file); the target must be closed because Desktop loads its session list
 //! once at startup, so Hydra closes it, copies, and launches it again.
 use crate::{install::Install, profiles::{self, Profile}};
@@ -39,7 +42,20 @@ pub struct Preview {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct TransferResult { copied: usize, skipped: usize, failed: usize }
+pub struct TransferResult {
+    copied: usize,
+    skipped: usize,
+    failed: usize,
+    /// Sessions already in the target whose transcript was brought up to date.
+    updated: usize,
+    /// Sessions continued in both accounts, brought over as a separate new session so the
+    /// target's own turns stay as they are.
+    forked: usize,
+}
+
+impl TransferResult {
+    fn new() -> Self { Self { copied: 0, skipped: 0, failed: 0, updated: 0, forked: 0 } }
+}
 
 struct Entry { session: Session, path: PathBuf, account: String, org: String }
 
@@ -336,7 +352,7 @@ pub fn import_chats(install: &Install, p: &Profile, raw: &str) -> Result<Transfe
         return Err("请选择 Claude 导出的 conversations.json 或单个含 chat_messages 的聊天。".into());
     }
     let dir = store_dir(&library(install, p, false, true), "archive", "chats")?;
-    let mut result = TransferResult { copied: 0, skipped: 0, failed: 0 };
+    let mut result = TransferResult::new();
     for row in rows {
         let bytes = serde_json::to_vec(&row).map_err(|e| e.to_string())?;
         let digest = Sha256::digest(row.get("uuid").and_then(Value::as_str).filter(|s| !s.is_empty())
@@ -362,18 +378,19 @@ pub fn preview(install: &Install, source: &Profile, target: &Profile) -> Result<
         let target_files = existing_target_files(install, target, dest)?;
         for s in &mut sessions {
             let name = s.id.rsplit('/').next().unwrap_or_default();
-            s.in_target = target_files.contains(name);
+            s.in_target = target_files.contains_key(name);
         }
     }
     Ok(Preview { sessions, target_problem: store.err(), running: is_running(install, &[target]) })
 }
 
-fn existing_target_files(install: &Install, target: &Profile, dest: &Path) -> Result<std::collections::HashSet<String>, String> {
+/// Index file name -> path of every index the target identity already has, in any of its roots.
+fn existing_target_files(install: &Install, target: &Profile, dest: &Path) -> Result<std::collections::HashMap<String, PathBuf>, String> {
     let target_org = dest.file_name();
     let target_account = dest.parent().and_then(Path::file_name);
     Ok(collect_roots(&roots(install, target))?.into_iter()
         .filter(|e| Some(std::ffi::OsStr::new(&e.account)) == target_account && Some(std::ffi::OsStr::new(&e.org)) == target_org)
-        .map(|e| e.path.file_name().unwrap().to_string_lossy().into_owned()).collect())
+        .map(|e| (e.path.file_name().unwrap().to_string_lossy().into_owned(), e.path)).collect())
 }
 
 fn replace_values(v: &mut Value, old_account: &str, old_org: &str, account: &str, org: &str) {
@@ -399,16 +416,147 @@ pub fn needs_closed_target(install: &Install, target: &Profile, ids: &[String]) 
     ids.iter().any(|id| !(id.starts_with("import/") && id.split('/').count() == 4)) && is_running(install, &[target])
 }
 
+fn dest_identity(dest: &Path) -> Option<(&str, &str)> {
+    Some((dest.parent()?.file_name()?.to_str()?, dest.file_name()?.to_str()?))
+}
+
+/// The source index rewritten for the target identity.
+fn index_for(entry: &Entry, account: &str, org: &str) -> Option<Vec<u8>> {
+    let mut json = read_index(&entry.path)?;
+    replace_values(&mut json, &entry.account, &entry.org, account, org);
+    serde_json::to_vec_pretty(&json).ok()
+}
+
+/// Where Claude Code started by this account keeps its transcripts (mirrors the launcher).
+fn code_home(p: &Profile) -> Option<PathBuf> {
+    let s = crate::settings::load();
+    if let Some(dir) = crate::launcher::private_code_dir(&s.effective(&p.id), p) { return Some(dir); }
+    profiles::env_vars(&s, &p.id).into_iter().find(|(k, _)| k.eq_ignore_ascii_case("CLAUDE_CONFIG_DIR"))
+        .map(|(_, v)| PathBuf::from(v))
+        .or_else(|| std::env::var_os("CLAUDE_CONFIG_DIR").filter(|v| !v.is_empty()).map(PathBuf::from))
+        .or_else(|| std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(|h| PathBuf::from(h).join(".claude")))
+}
+
+/// How the target's copy of a transcript compares with the source's, worst last.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Sync { Missing, Same, Copied, Updated, Diverged }
+
+/// Write `data` to `path` through a temporary file, replacing what is there.
+fn replace_file(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    let parent = path.parent().ok_or_else(|| std::io::Error::other("invalid path"))?;
+    fs::create_dir_all(parent)?;
+    let temp = parent.join(format!(".hydra-sync-{}", uuid::Uuid::new_v4()));
+    let written = fs::File::create(&temp).and_then(|mut f| f.write_all(data).and_then(|_| f.sync_all()))
+        .and_then(|_| fs::rename(&temp, path));
+    if written.is_err() { let _ = fs::remove_file(&temp); }
+    written
+}
+
+/// Copy files under `from` that `to` does not have yet (attachments next to a transcript).
+fn copy_missing_tree(from: &Path, to: &Path) -> std::io::Result<()> {
+    let Ok(meta) = fs::symlink_metadata(from) else { return Ok(()) };
+    if meta.is_dir() {
+        for entry in fs::read_dir(from)? {
+            let entry = entry?;
+            copy_missing_tree(&entry.path(), &to.join(entry.file_name()))?;
+        }
+    } else if meta.is_file() && !to.try_exists()? {
+        fs::create_dir_all(to.parent().unwrap())?;
+        fs::copy(from, to)?;
+    }
+    Ok(())
+}
+
+/// Replace every complete JSON string `"from"` in `bytes` with `"to"`.
+fn rename_id(bytes: &[u8], from: &str, to: &str) -> Vec<u8> {
+    let (from, to) = (format!("\"{from}\""), format!("\"{to}\""));
+    let (from, to) = (from.as_bytes(), to.as_bytes());
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut rest = bytes;
+    while let Some(i) = rest.windows(from.len()).position(|w| w == from) {
+        out.extend_from_slice(&rest[..i]);
+        out.extend_from_slice(to);
+        rest = &rest[i + from.len()..];
+    }
+    out.extend_from_slice(rest);
+    out
+}
+
+/// A fixed id derived from `seed` and `n`, so the same migration always lands on the same copy.
+fn derived_id(seed: &str, n: u32) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(format!("hydra-fork:{seed}:{n}").as_bytes());
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    uuid::Builder::from_random_bytes(bytes).into_uuid().to_string()
+}
+
+/// Bring the target's copy of transcript `id` up to date with the source's, stored as `as_id`
+/// (the ids inside are renamed to match). A target copy is replaced only when the source
+/// extends it byte for byte, so nothing the target wrote is lost.
+fn sync_transcript(from: &Path, to: &Path, id: &str, as_id: &str) -> std::io::Result<Sync> {
+    let name = format!("{id}.jsonl");
+    let mut outcome = Sync::Missing;
+    for project in dirs(&from.join("projects")).map_err(std::io::Error::other)? {
+        let source = project.join(&name);
+        if !fs::symlink_metadata(&source).is_ok_and(|m| m.is_file()) { continue; }
+        let target_dir = to.join("projects").join(project.file_name().unwrap());
+        let target = target_dir.join(format!("{as_id}.jsonl"));
+        let mut bytes = fs::read(&source)?;
+        // Claude Code may be appending right now: never carry over a half-written last line.
+        bytes.truncate(bytes.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1));
+        if as_id != id { bytes = rename_id(&bytes, id, as_id); }
+        let step = match fs::read(&target) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => { replace_file(&target, &bytes)?; Sync::Copied }
+            Err(e) => return Err(e),
+            // Equal, or the target went on from here: it already has everything.
+            Ok(old) if old.starts_with(&bytes) => Sync::Same,
+            Ok(old) if bytes.starts_with(&old) => { replace_file(&target, &bytes)?; Sync::Updated }
+            Ok(_) => Sync::Diverged,
+        };
+        if step != Sync::Diverged { copy_missing_tree(&project.join(id), &target_dir.join(as_id))?; }
+        outcome = outcome.max(step);
+    }
+    Ok(outcome)
+}
+
+/// Bring over a session both accounts continued as a new session of the target, leaving the
+/// target's own copy alone. Copy `n` of a transcript always gets the same ids, so migrating
+/// again refreshes that copy; only once the target continues the copy too is the next made.
+fn fork_session(entry: &Entry, from: &Path, to: &Path, transcript: &str, dest: &Path,
+    existing: &std::collections::HashMap<String, PathBuf>, label: &str) -> Result<Sync, String> {
+    let (account, org) = dest_identity(dest).ok_or("目标账号路径无效。")?;
+    for n in 0..64 {
+        let fork = derived_id(transcript, n);
+        let synced = sync_transcript(from, to, transcript, &fork).map_err(|e| e.to_string())?;
+        if synced == Sync::Diverged { continue; }
+        let local = format!("local_{}", derived_id(&fork, 0));
+        let name = format!("{local}.json");
+        let mut json = read_index(&entry.path).ok_or("无法读取会话索引。")?;
+        replace_values(&mut json, &entry.account, &entry.org, account, org);
+        let obj = json.as_object_mut().ok_or("会话索引格式无效。")?;
+        obj.insert("sessionId".into(), Value::String(local));
+        obj.insert("cliSessionId".into(), Value::String(fork));
+        let title = text(&Value::Object(obj.clone()), &["title"]).unwrap_or_else(|| "会话".into());
+        obj.insert("title".into(), Value::String(format!("{title}（来自 {label}）")));
+        let data = serde_json::to_vec_pretty(&json).map_err(|e| e.to_string())?;
+        return match existing.get(&name) {
+            Some(path) if synced == Sync::Updated => replace_file(path, &data).map(|_| Sync::Updated).map_err(|e| e.to_string()),
+            Some(_) => Ok(Sync::Same),
+            None => insert_file(&dest.join(name), &data).map(|_| Sync::Copied),
+        };
+    }
+    Err("这条会话的迁移副本过多。".into())
+}
+
 fn copy_into(available: &[Entry], dest: &Path, ids: &[String]) -> Result<TransferResult, String> {
     let account = dest.parent().and_then(Path::file_name).and_then(|v| v.to_str()).ok_or("目标账号路径无效。")?;
     let org = dest.file_name().and_then(|v| v.to_str()).ok_or("目标组织路径无效。")?;
-    let mut result = TransferResult { copied: 0, skipped: 0, failed: 0 };
+    let mut result = TransferResult::new();
     for id in ids {
         let Some(entry) = available.iter().find(|x| &x.session.id == id) else { result.failed += 1; continue };
         let Some(name) = entry.path.file_name() else { result.failed += 1; continue };
-        let Some(mut json) = read_index(&entry.path) else { result.failed += 1; continue };
-        replace_values(&mut json, &entry.account, &entry.org, account, org);
-        let Ok(data) = serde_json::to_vec_pretty(&json) else { result.failed += 1; continue };
+        let Some(data) = index_for(entry, account, org) else { result.failed += 1; continue };
         let file = dest.join(name);
         match OpenOptions::new().write(true).create_new(true).open(&file) {
             Ok(mut f) => {
@@ -427,15 +575,51 @@ pub fn copy(install: &Install, source: &Profile, target: &Profile, ids: &[String
     let items = entries(install, source, false)?;
     let (imports, native): (Vec<_>, Vec<_>) = ids.iter().cloned()
         .partition(|id| id.starts_with("import/") && id.split('/').count() == 4);
-    let mut result = TransferResult { copied: 0, skipped: 0, failed: 0 };
+    let mut result = TransferResult::new();
     if !native.is_empty() {
         if is_running(install, &[target]) { return Err(format!("目标账号「{}」正在运行，需要重启后才能迁移本地会话。", target.name)); }
         let dest = target_store(install, target)?;
         let existing = existing_target_files(install, target, &dest)?;
-        let (present, missing): (Vec<_>, Vec<_>) = native.into_iter().partition(|id|
-            items.iter().any(|e| &e.session.id == id) && existing.contains(id.rsplit('/').next().unwrap_or_default()));
+        let (present, missing): (Vec<_>, Vec<_>) = native.iter().cloned().partition(|id|
+            items.iter().any(|e| &e.session.id == id) && existing.contains_key(id.rsplit('/').next().unwrap_or_default()));
         result = copy_into(&items, &dest, &missing)?;
-        result.skipped += present.len();
+        // Without the transcript the target would resume the session from whatever stale copy
+        // its own Claude Code folder has (or none), so carry it over whenever the folders differ.
+        let homes = code_home(source).zip(code_home(target)).filter(|(from, to)| from != to);
+        for id in &native {
+            let Some(entry) = items.iter().find(|e| &e.session.id == id) else { continue };
+            let in_target = present.contains(id);
+            let transcript = entry.session.transcript_id.as_deref().filter(|t| uuid::Uuid::parse_str(t).is_ok());
+            let synced = match (&homes, transcript) {
+                (Some((from, to)), Some(transcript)) => sync_transcript(from, to, transcript, transcript),
+                _ => Ok(Sync::Missing),
+            };
+            match synced {
+                Ok(Sync::Updated) if in_target => {
+                    // The target never continued this session, so its index may follow the source too.
+                    let name = id.rsplit('/').next().unwrap_or_default();
+                    let refreshed = existing.get(name).zip(dest_identity(&dest)).and_then(|(path, (account, org))|
+                        index_for(entry, account, org).map(|data| replace_file(path, &data)));
+                    if matches!(refreshed, Some(Ok(()))) { result.updated += 1 } else { result.failed += 1 }
+                }
+                Ok(Sync::Diverged) => {
+                    // Both accounts went on: bring the source's version over as a new session.
+                    let forked = match (&homes, transcript) {
+                        (Some((from, to)), Some(transcript)) => fork_session(entry, from, to, transcript, &dest, &existing, &source.name),
+                        _ => Err(String::new()),
+                    };
+                    match forked {
+                        Ok(Sync::Copied) => result.forked += 1,
+                        Ok(Sync::Updated) => result.updated += 1,
+                        Ok(_) => result.skipped += 1,
+                        Err(_) => result.failed += 1,
+                    }
+                }
+                Ok(_) if in_target => result.skipped += 1,
+                Ok(_) => {}
+                Err(_) => result.failed += 1,
+            }
+        }
     }
     if !imports.is_empty() {
         let dest = store_dir(&library(install, target, false, true), "archive", "chats")?;
@@ -582,6 +766,81 @@ mod tests {
         fs::write(target.join(&name), b"continued").unwrap();
         restore();
         assert_eq!(fs::read(target.join(name)).unwrap(), b"continued");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn transcripts_follow_the_source_without_losing_target_turns() {
+        let root = temp("transcript-sync");
+        let (from, to) = (root.join("from"), root.join("to"));
+        let project = from.join("projects").join("proj");
+        let id = "0e142dcc-3472-4c5d-b7a1-738234280296";
+        let (source, target) = (project.join(format!("{id}.jsonl")), to.join("projects/proj").join(format!("{id}.jsonl")));
+        fs::create_dir_all(project.join(id)).unwrap();
+        fs::write(project.join(id).join("note"), b"sidecar").unwrap();
+        fs::write(&source, b"one\n").unwrap();
+        assert_eq!(sync_transcript(&from, &to, id, id).unwrap(), Sync::Copied);
+        assert_eq!(fs::read(to.join("projects/proj").join(id).join("note")).unwrap(), b"sidecar");
+        // The source went on, and is mid-write: take the complete new line only.
+        fs::write(&source, b"one\ntwo\nthr").unwrap();
+        assert_eq!(sync_transcript(&from, &to, id, id).unwrap(), Sync::Updated);
+        assert_eq!(fs::read(&target).unwrap(), b"one\ntwo\n");
+        assert_eq!(sync_transcript(&from, &to, id, id).unwrap(), Sync::Same);
+        // The target went on by itself: nothing to bring over.
+        fs::write(&target, b"one\ntwo\nmine\n").unwrap();
+        assert_eq!(sync_transcript(&from, &to, id, id).unwrap(), Sync::Same);
+        // Both went on: the target's turns are kept.
+        fs::write(&source, b"one\ntwo\ntheirs\n").unwrap();
+        assert_eq!(sync_transcript(&from, &to, id, id).unwrap(), Sync::Diverged);
+        assert_eq!(fs::read(&target).unwrap(), b"one\ntwo\nmine\n");
+        // A copy under another id renames the ids inside, not text that merely contains them.
+        fs::write(&source, format!("{{\"sessionId\":\"{id}\",\"text\":\"x{id}\"}}\n")).unwrap();
+        let fork = derived_id(id, 0);
+        assert_eq!(fork, derived_id(id, 0));
+        assert_eq!(sync_transcript(&from, &to, id, &fork).unwrap(), Sync::Copied);
+        let copied = fs::read_to_string(to.join("projects/proj").join(format!("{fork}.jsonl"))).unwrap();
+        assert_eq!(copied, format!("{{\"sessionId\":\"{fork}\",\"text\":\"x{id}\"}}\n"));
+        assert!(to.join("projects/proj").join(&fork).join("note").exists());
+        assert_eq!(sync_transcript(&from, &to, "11111111-1111-1111-1111-111111111111", "11111111-1111-1111-1111-111111111111").unwrap(), Sync::Missing);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sessions_continued_in_both_accounts_arrive_as_one_refreshable_copy() {
+        let root = temp("fork");
+        let (from, to) = (root.join("from"), root.join("to"));
+        let id = "0e142dcc-3472-4c5d-b7a1-738234280296";
+        let index = store_dir(&root.join("src-sessions"), "acc-a", "org-a").unwrap();
+        fs::write(index.join("local_1.json"), serde_json::json!({"sessionId": "local_1", "cliSessionId": id, "title": "Demo", "account": "acc-a"}).to_string()).unwrap();
+        let dest = store_dir(&root.join("dst-sessions"), "acc-b", "org-b").unwrap();
+        let entries = collect(&root.join("src-sessions")).unwrap();
+        let source = from.join("projects/proj").join(format!("{id}.jsonl"));
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::write(&source, format!("{{\"sessionId\":\"{id}\"}}\n")).unwrap();
+        let existing = || collect(&root.join("dst-sessions")).unwrap().into_iter()
+            .map(|e| (e.path.file_name().unwrap().to_string_lossy().into_owned(), e.path)).collect();
+        let fork = |label| fork_session(&entries[0], &from, &to, id, &dest, &existing(), label).unwrap();
+        assert_eq!(fork("A"), Sync::Copied);
+        let copies = collect(&root.join("dst-sessions")).unwrap();
+        assert_eq!(copies.len(), 1);
+        let json = read_index(&copies[0].path).unwrap();
+        let cli = json["cliSessionId"].as_str().unwrap().to_owned();
+        assert_ne!(cli, id);
+        assert_eq!(json["title"], "Demo（来自 A）");
+        assert_eq!(json["account"], "acc-b");
+        assert_eq!(format!("{}.json", json["sessionId"].as_str().unwrap()), copies[0].path.file_name().unwrap().to_string_lossy());
+        let copy = to.join("projects/proj").join(format!("{cli}.jsonl"));
+        assert_eq!(fs::read_to_string(&copy).unwrap(), format!("{{\"sessionId\":\"{cli}\"}}\n"));
+        // Migrating again, unchanged or after the source went on, reuses the same copy.
+        assert_eq!(fork("A"), Sync::Same);
+        fs::write(&source, format!("{{\"sessionId\":\"{id}\"}}\nmore\n")).unwrap();
+        assert_eq!(fork("A"), Sync::Updated);
+        assert_eq!(collect(&root.join("dst-sessions")).unwrap().len(), 1);
+        // Once the target continues the copy too, the next migration makes a second one.
+        fs::write(&copy, "mine\n").unwrap();
+        assert_eq!(fork("A"), Sync::Copied);
+        assert_eq!(collect(&root.join("dst-sessions")).unwrap().len(), 2);
+        assert_eq!(fs::read_to_string(&copy).unwrap(), "mine\n");
         fs::remove_dir_all(root).unwrap();
     }
 

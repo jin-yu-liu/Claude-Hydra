@@ -34,7 +34,7 @@ export function CodeSessionMigration({ profiles, source, setSource }: { profiles
     try {
       const r = await api.copySessions(source, target, [...picked]);
       setPreview(await api.sessionPreview(source, target)); setPicked(new Set());
-      setStatus(`已复制 ${r.copied} 个，跳过已存在 ${r.skipped} 个，失败 ${r.failed} 个。请打开目标账号确认会话列表。`);
+      setStatus(`已复制 ${r.copied} 个，跳过已存在 ${r.skipped} 个，失败 ${r.failed} 个${r.forked ? `，${r.forked} 个在两个账号里都继续过、已作为新会话迁入` : ""}。请打开目标账号确认会话列表。`);
     } catch (e) { setStatus(errorText(e)); }
     finally { setBusy(false); }
   };
