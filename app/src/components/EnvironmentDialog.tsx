@@ -39,7 +39,6 @@ const place = (x: ExitInfo) => [x.country, x.region, x.city].filter(Boolean).joi
 export function EnvironmentDialog({ open, id, initial, detectedTimezone, exitBaseline, onClose, onSaved }: Props) {
   const [env, setEnv] = useState<EnvironmentInput>(emptyEnvironment);
   const [saving, setSaving] = useState(false);
-  const [quietStatus, setQuietStatus] = useState<"idle" | "applying" | "done">("idle");
   const [error, setError] = useState("");
   const [sandbox, setSandbox] = useState<{ ok: boolean; text: string } | null>(null);
   const [baseline, setBaseline] = useState<string | null>(null);
@@ -47,7 +46,6 @@ export function EnvironmentDialog({ open, id, initial, detectedTimezone, exitBas
 
   useEffect(() => {
     if (!open) return;
-    setQuietStatus("idle");
     setEnv(initial ? { ...emptyEnvironment(), ...structuredClone(initial) } : emptyEnvironment());
     setError("");
     setBaseline(exitBaseline ? `${exitBaseline.ip}${place(exitBaseline) ? `（${place(exitBaseline)}）` : ""}` : null);
@@ -149,14 +147,6 @@ export function EnvironmentDialog({ open, id, initial, detectedTimezone, exitBas
               <span className="text-[11.5px] text-muted">{env.isolation === "sandboxie" ? `在 ${ISOLATION_NAME} 中运行` : "不使用沙箱"}</span>
             </Line>
             <p className="px-4 pb-3 text-[11.5px] leading-relaxed text-muted">
-              {env.isolation === "sandboxie" && sandbox?.ok && !IS_MAC && <span className="mb-2 block">
-                <Button variant="outline" disabled={quietStatus !== "idle"} onClick={async () => {
-                  setQuietStatus("applying");
-                  try { await api.configureQuietSandbox(); setQuietStatus("done"); }
-                  catch (e) { setError(errorText(e)); setQuietStatus("idle"); }
-                }}>{quietStatus === "done" ? "已应用静默启动" : quietStatus === "applying" ? "正在应用…" : "启用沙箱静默启动"}</Button>
-                <span className="mt-1 block">立即应用到当前 Windows 用户的所有沙箱。启动时不自动打开 Sandboxie Control，并隐藏 ConsoleInit (C00000D4) 提示。</span>
-              </span>}
               {env.isolation === "sandboxie"
                 ? (IS_MAC
                   ? "启动前用 macOS 的 Seatbelt 沙盒验证：沙盒内只能连接本机回环（中继），直连外部地址会被内核拒绝，验证不通过就不启动。账号浏览页的 Canvas / WebGL / GPU / 字体测量 / 屏幕等网页指纹按账号派生（尽力而为，需要 Claude 提供调试端口，失败会记录日志）。注意：主机名、网卡 MAC、IOPlatformUUID、序列号等系统级硬件标识仍与主机相同——macOS 不像 Sandboxie 那样能按进程改写这些内核值，只有虚拟机才能完全隔离。"

@@ -1,13 +1,13 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Claude-Hydra",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "identifier": "local.claude-hydra",
   "build": {
     "frontendDist": "../dist",
     "devUrl": "http://localhost:3017",
     "beforeDevCommand": "node scripts/fetch-mihomo.mjs && pnpm run dev:renderer",
-    "beforeBuildCommand": "node scripts/fetch-mihomo.mjs && pnpm run build:renderer"
+    "beforeBuildCommand": "node scripts/fetch-mihomo.mjs && node scripts/fetch-sandboxie.mjs && pnpm run build:renderer"
   },
   "app": {
     "windows": [
@@ -52,7 +52,8 @@
     "longDescription": "Run several Claude desktop accounts side by side.",
     "windows": {
       "nsis": {
-        "installMode": "currentUser"
+        "installMode": "perMachine",
+        "installerHooks": "windows/installer-hooks.nsh"
       }
     },
     "macOS": {

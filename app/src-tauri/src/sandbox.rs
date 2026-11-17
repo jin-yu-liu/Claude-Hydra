@@ -292,7 +292,7 @@ fn install_dir() -> Option<PathBuf> {
 pub fn available() -> Result<PathBuf, String> {
     #[cfg(windows)]
     {
-        return install_dir().ok_or_else(|| "没有检测到 Sandboxie-Plus。请先安装 Sandboxie-Plus（需要管理员权限并安装驱动），再启用沙箱隔离。".into());
+        return install_dir().ok_or_else(|| "没有检测到 Sandboxie-Plus。请重新运行 Claude Hydra 的 Windows 安装程序，授权安装沙箱组件。".into());
     }
     #[cfg(target_os = "macos")]
     {
@@ -324,26 +324,29 @@ fn ini(dir: &Path, args: &[&str]) -> Result<(), String> {
 }
 
 /// Sandboxie resolves UserSettings_ to the calling user's settings section.
-/// Apply once on explicit request, since controller auto-start is shared by all boxes.
+/// Apply the quiet defaults for the Windows user launching the box.
 #[cfg(windows)]
-pub fn configure_quiet_start() -> Result<(), String> {
-    let dir = available()?;
+fn configure_quiet_start(dir: &Path) -> Result<(), String> {
+    static APPLIED: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
+    let mut applied = APPLIED.lock().unwrap_or_else(|e| e.into_inner());
+    if *applied { return Ok(()); }
     let section = "UserSettings_";
     let detail = "2205,ConsoleInit (C00000D4)";
-    ini(&dir, &["set", section, "SbieCtrl_EnableAutoStart", "n"])?;
-    ini(&dir, &["delete", section, "SbieCtrl_HideMessage", detail])?;
-    ini(&dir, &["append", section, "SbieCtrl_HideMessage", detail])
+    ini(dir, &["set", section, "SbieCtrl_EnableAutoStart", "n"])?;
+    ini(dir, &["delete", section, "SbieCtrl_HideMessage", detail])?;
+    ini(dir, &["append", section, "SbieCtrl_HideMessage", detail])?;
+    *applied = true;
+    Ok(())
 }
-
-/// Nothing to configure on macOS: `sandbox-exec` starts with the account, there is no shared
-/// controller to keep quiet.
-#[cfg(not(windows))]
-pub fn configure_quiet_start() -> Result<(), String> { Ok(()) }
 
 /// Creates or updates the account's box. `relay_port` = the only address the box may reach;
 /// `None` (no node) leaves the network unrestricted. Each box gets its own Code directory.
 pub fn configure(id: &str, data_dir: &str, #[cfg_attr(not(windows), allow(unused_variables))] session_roots: &[PathBuf], relay_port: Option<u16>) -> Result<String, String> {
     let dir = available()?;
+    #[cfg(windows)]
+    if let Err(error) = configure_quiet_start(&dir) {
+        eprintln!("未能应用沙箱静默启动设置：{error}");
+    }
     let name = box_name(id);
     let drop = drop_dir();
     std::fs::create_dir_all(&drop).map_err(|e| format!("无法创建链接转交目录：{e}"))?;

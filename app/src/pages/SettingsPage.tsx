@@ -167,6 +167,16 @@ export function SettingsPage({ info, reloadInfo, theme, onThemeChange, onInstall
             </Button>
           </Row>
         </Group>
+
+        {info?.platform === "windows" && (
+          <Group label="沙箱设置">
+            <Row label="沙箱管理器" hint="查看沙箱、运行中的程序和高级设置。">
+              <Button variant="outline" size="sm" disabled={busy === "sandbox"} onClick={() => act("sandbox", api.openSandboxManager)}>
+                打开沙箱管理
+              </Button>
+            </Row>
+          </Group>
+        )}
       </div>
     </Page>
   );

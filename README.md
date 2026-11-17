@@ -119,7 +119,7 @@ Claude 只看得到本机中继地址；节点的账号密码保存在 Hydra 内
 
 | | Windows（Sandboxie-Plus） | macOS（Seatbelt） |
 | --- | --- | --- |
-| 前提 | 先安装 [Sandboxie-Plus](https://sandboxie-plus.com/)（需管理员权限与驱动） | 系统自带，无需安装、无需关闭 SIP |
+| 前提 | Windows 安装程序请求管理员授权，自动安装随包附带的 [Sandboxie-Plus 1.18.8](https://github.com/sandboxie-plus/Sandboxie/releases/tag/v1.18.8)，或复用已安装的组件。安装后在环境配置中打开或关闭「沙箱隔离」并保存 | 系统自带 Seatbelt，启用沙箱无需安装驱动或管理员授权 |
 | 网络 | 只允许连接本账号的本地中继，任何绕过代理的进程都会断网 | 拒绝一切出站连接，只放行本账号中继的端口；本机 Clash 等代理和其他账号的中继也连不上 |
 | DNS | 注入防护模块，拒绝系统 DNS 通道、拦截发往非本机地址的连接，域名只经节点解析 | 屏蔽系统 DNS 服务，域名只经节点解析 |
 | 文件与注册表 | 写入留在沙箱内（账号数据目录除外） | 不虚拟化，只限制网络 |
@@ -129,7 +129,7 @@ Claude 只看得到本机中继地址；节点的账号密码保存在 Hydra 内
 - 沙盒由 Claude 启动的所有子进程继承，包括 Claude Code、git 和 MCP 服务。Windows 沙箱内还会为 git 生成专用配置，把它的代理也指向中继。
 - 开启沙盒时会强制使用 **独立 Code** 目录，避免各账号报出同一个 Claude Code 设备 ID。
 - Windows 商店版会先复制一份到 Hydra 数据目录再装入沙箱，首次启动较慢。
-- Windows 可在环境中点 **启用沙箱静默启动**，启动时不弹出 Sandboxie Control 与 ConsoleInit 提示。
+- Windows 沙箱默认静默启动。可从 **设置 → 沙箱设置 → 打开沙箱管理** 打开管理器。全新默认安装时组件位于 Hydra 目录下的 Sandboxie-Plus 子目录，不创建桌面快捷方式。自选 Hydra 安装目录时，沙箱组件使用 Sandboxie 的系统安装位置。
 - macOS 沙盒内的 Claude Code 连不上本机其他回环服务（如本地 MCP、IDE 扩展端口）。这是只放行中继端口的代价。
 
 实现细节与边界：[docs/macos-isolation-status.md](docs/macos-isolation-status.md)、[docs/fingerprint-device-isolation-status.md](docs/fingerprint-device-isolation-status.md)。

@@ -302,8 +302,15 @@ fn sandbox_status() -> Result<String, String> {
 }
 
 #[tauri::command]
-fn configure_quiet_sandbox() -> Result<(), String> {
-    sandbox::configure_quiet_start()
+fn open_sandbox_manager() -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        let dir = sandbox::available()?;
+        std::process::Command::new(dir.join("SandMan.exe")).current_dir(dir)
+            .spawn().map(|_| ()).map_err(|e| format!("无法打开沙箱管理：{e}"))
+    }
+    #[cfg(not(windows))]
+    Err("沙箱管理仅适用于 Windows。".into())
 }
 
 #[tauri::command]
@@ -674,7 +681,7 @@ pub fn run(start_in_tray: bool) {
             resume_account,
             rebind_exit,
             sandbox_status,
-            configure_quiet_sandbox,
+            open_sandbox_manager,
             diagnostics,
             session_preview,
             read_import,
