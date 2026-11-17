@@ -139,7 +139,7 @@ fn roaming_app_data() -> Option<PathBuf> {
 /// before), the Store package's virtualized copy of it, and `%LOCALAPPDATA%\Claude-Data`,
 /// where newer builds move their data out of the package.
 #[cfg(windows)]
-fn default_candidates(package: Option<&Path>) -> Vec<PathBuf> {
+pub(crate) fn default_candidates(package: Option<&Path>) -> Vec<PathBuf> {
     let mut out = Vec::new();
     if let Some(pkg) = package {
         out.push(pkg.join("LocalCache\\Roaming\\Claude"));

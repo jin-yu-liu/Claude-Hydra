@@ -342,7 +342,7 @@ pub fn configure_quiet_start() -> Result<(), String> { Ok(()) }
 
 /// Creates or updates the account's box. `relay_port` = the only address the box may reach;
 /// `None` (no node) leaves the network unrestricted. Each box gets its own Code directory.
-pub fn configure(id: &str, data_dir: &str, #[cfg_attr(not(windows), allow(unused_variables))] session_root: &Path, relay_port: Option<u16>) -> Result<String, String> {
+pub fn configure(id: &str, data_dir: &str, #[cfg_attr(not(windows), allow(unused_variables))] session_roots: &[PathBuf], relay_port: Option<u16>) -> Result<String, String> {
     let dir = available()?;
     let name = box_name(id);
     let drop = drop_dir();
@@ -435,7 +435,7 @@ pub fn configure(id: &str, data_dir: &str, #[cfg_attr(not(windows), allow(unused
         if let Some(legacy) = legacy.filter(|p| p != &code) {
             let boxed = box_copy(&root, &legacy);
             let sources: Vec<_> = std::iter::once(legacy).chain(boxed).collect();
-            crate::sessions::recover_projects(session_root, &code, &sources)?;
+            crate::sessions::recover_projects(session_roots, &code, &sources)?;
         }
     }
     Ok(name)
@@ -898,7 +898,7 @@ if ($needed -gt 0) {
         let data = crate::paths::storage_root().join("proxy-test");
         std::fs::create_dir_all(&data).unwrap();
         let id = "hydra-proxy-integration-test";
-        let name = super::configure(id, &data.to_string_lossy(), &data.join("claude-code-sessions"), None).unwrap();
+        let name = super::configure(id, &data.to_string_lossy(), &[data.join("claude-code-sessions")], None).unwrap();
         let key = r"Software\Policies\Claude";
         let host = [true, false].map(|machine| crate::sys::reg_string(machine, key, "egressProxyUrl"));
         let host_https = crate::sys::reg_string(false, "Environment", "HTTPS_PROXY");
@@ -947,7 +947,7 @@ if ($needed -gt 0) {
         let port = relay.local_addr().unwrap().port();
         let other = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let other_port = other.local_addr().unwrap().port();
-        let name = super::configure(id, &data.to_string_lossy(), &data.join("claude-code-sessions"), Some(port)).unwrap();
+        let name = super::configure(id, &data.to_string_lossy(), &[data.join("claude-code-sessions")], Some(port)).unwrap();
         println!("box {name}, relay port {port}");
 
         // 1) network rules, through `command` (what launcher uses).
@@ -1016,7 +1016,7 @@ if ($needed -gt 0) {
         let data = crate::paths::storage_root().join("identity-test");
         std::fs::create_dir_all(&data).unwrap();
         let ids = crate::identity::Identifiers::for_account("hydra-identity-test");
-        let name = super::configure("hydra-identity-test", &data.to_string_lossy(), &data.join("claude-code-sessions"), None).unwrap();
+        let name = super::configure("hydra-identity-test", &data.to_string_lossy(), &[data.join("claude-code-sessions")], None).unwrap();
         // What the host calls itself, for the probe to look up by name as a control.
         let host_user = std::env::var("USERNAME").unwrap();
         let host_name = std::env::var("COMPUTERNAME").unwrap();
@@ -1319,7 +1319,7 @@ if ($needed -gt 0) {
         let dir = super::available().unwrap();
         let data = crate::paths::storage_root().join("wmi-test");
         std::fs::create_dir_all(&data).unwrap();
-        let name = super::configure("hydra-wmi-test", &data.to_string_lossy(), &data.join("claude-code-sessions"), None).unwrap();
+        let name = super::configure("hydra-wmi-test", &data.to_string_lossy(), &[data.join("claude-code-sessions")], None).unwrap();
 
         // The host's real identifiers, read outside the box. A query inside the box that prints one
         // of them is the leak this test exists for.
@@ -1443,7 +1443,7 @@ if ($needed -gt 0) {
         use std::os::windows::process::CommandExt;
         let id = "hydra-injection-test";
         let data = crate::paths::storage_root().join("injection-test");
-        let name = super::configure(id, &data.to_string_lossy(), &data.join("claude-code-sessions"), None).unwrap();
+        let name = super::configure(id, &data.to_string_lossy(), &[data.join("claude-code-sessions")], None).unwrap();
         let count = |key: &str| {
             let out = std::process::Command::new(dir.join("SbieIni.exe")).args(["query", &name, key]).creation_flags(0x0800_0000).output().unwrap();
             assert!(out.status.success(), "query {key} failed");

@@ -55,6 +55,34 @@ pub(crate) fn root(install: &Install, p: &Profile) -> PathBuf {
     install.data_dir(Path::new(&p.path)).join("claude-code-sessions")
 }
 
+pub(crate) fn roots(install: &Install, p: &Profile) -> Vec<PathBuf> {
+    #[allow(unused_mut)]
+    let mut paths = vec![root(install, p)];
+    #[cfg(windows)]
+    if p.is_default && install.is_msix() {
+        let package = std::env::var_os("LOCALAPPDATA").zip(install.family.as_ref())
+            .map(|(local, family)| PathBuf::from(local).join("Packages").join(family));
+        for profile in crate::install::default_candidates(package.as_deref()) {
+            let candidate = profile.join("claude-code-sessions");
+            if !paths.contains(&candidate) { paths.push(candidate); }
+        }
+    }
+    paths
+}
+
+fn collect_roots(paths: &[PathBuf]) -> Result<Vec<Entry>, String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut entries = Vec::new();
+    for path in paths {
+        entries.extend(collect(path)?.into_iter().filter(|e| seen.insert(e.session.id.clone())));
+    }
+    Ok(entries)
+}
+
+fn native_trash(root: &Path) -> PathBuf {
+    root.with_file_name("hydra-session-library").join("trash").join("native")
+}
+
 #[cfg(windows)]
 fn packaged_session_root(local: &Path, family: &str) -> Option<PathBuf> {
     let root = local.join("Claude-Data").join(family).join("claude-code-sessions");
@@ -90,9 +118,9 @@ fn stores(path: &Path) -> Result<Vec<PathBuf>, String> {
 /// Restore only transcripts named by this Desktop profile when switching Code directories.
 /// Keep project names intact: Desktop uses them to resolve the transcript for a working folder.
 #[cfg(windows)]
-pub(crate) fn recover_projects(session_root: &Path, code: &Path, old_roots: &[PathBuf]) -> Result<(), String> {
+pub(crate) fn recover_projects(session_roots: &[PathBuf], code: &Path, old_roots: &[PathBuf]) -> Result<(), String> {
     use std::collections::HashSet;
-    let entries = collect(session_root)?;
+    let entries = collect_roots(session_roots)?;
     let ids: HashSet<_> = entries.into_iter().filter_map(|e| e.session.transcript_id)
         .filter(|id| uuid::Uuid::parse_str(id).is_ok()).collect();
     if ids.is_empty() { return Ok(()); }
@@ -179,7 +207,11 @@ fn collect(path: &Path) -> Result<Vec<Entry>, String> {
 
 /// The single identity store in the target account, or a user-facing reason why there isn't one.
 fn target_store(install: &Install, target: &Profile) -> Result<PathBuf, String> {
-    let mut found = stores(&root(install, target))?;
+    let mut found = Vec::new();
+    for path in roots(install, target) {
+        found = stores(&path)?;
+        if !found.is_empty() { break; }
+    }
     match found.len() {
         1 => Ok(found.remove(0)),
         0 => Err("目标账号还没有会话目录。请先在目标账号的 Claude Code 中新建一个会话，再回来迁移。".into()),
@@ -201,7 +233,12 @@ fn library(install: &Install, p: &Profile, trash: bool, imported: bool) -> PathB
 }
 
 fn entries(install: &Install, p: &Profile, trash: bool) -> Result<Vec<Entry>, String> {
-    let mut native = collect(&library(install, p, trash, false))?;
+    let mut paths = roots(install, p);
+    if trash {
+        paths = paths.iter().map(|path| native_trash(path)).collect();
+        paths.push(library(install, p, true, false)); // Previous releases used a shared recycle bin.
+    }
+    let mut native = collect_roots(&paths)?;
     let mut imports = collect(&library(install, p, trash, true))?;
     for entry in &mut imports { entry.session.id = format!("import/{}", entry.session.id); }
     native.extend(imports);
@@ -254,14 +291,33 @@ pub fn recycle(install: &Install, p: &Profile, action: &str, id: &str) -> Result
     let trash = action != "delete";
     let items = entries(install, p, trash)?;
     if action == "empty" {
-        for e in items { fs::remove_file(e.path).map_err(|e| e.to_string())?; }
+        let mut bins: Vec<_> = roots(install, p).iter().map(|path| native_trash(path)).collect();
+        bins.extend([library(install, p, true, false), library(install, p, true, true)]);
+        for bin in bins {
+            for e in collect(&bin)? { fs::remove_file(e.path).map_err(|e| e.to_string())?; }
+        }
         return Ok(());
     }
     if !matches!(action, "delete" | "restore") { return Err("未知操作。".into()); }
     let item = items.iter().find(|e| e.session.id == id).ok_or("会话已变更，请刷新。")?;
     let imported = item.session.id.starts_with("import/") && item.session.id.split('/').count() == 4;
     if !imported && is_running(install, &[p]) { return Err("请先退出该 Claude 账号，再修改本地会话。".into()); }
-    let dest = store_dir(&library(install, p, !trash, imported), &item.account, &item.org)?
+    let mut destination = library(install, p, !trash, imported);
+    if !imported {
+        let paths = roots(install, p);
+        if !trash && paths.iter().filter(|root| root.join(id).is_file()).count() > 1 {
+            return Err("新旧目录中都存在这条会话索引，请先确认需要保留的副本。".into());
+        }
+        if trash && paths.iter().any(|root| root.join(id).is_file()) {
+            return Err("当前会话目录中已存在这条记录。".into());
+        }
+        for root in paths {
+            let bin = native_trash(&root);
+            if item.path.starts_with(&bin) { destination = root; break; }
+            if item.path.starts_with(&root) { destination = bin; break; }
+        }
+    }
+    let dest = store_dir(&destination, &item.account, &item.org)?
         .join(item.path.file_name().ok_or("无效会话文件名")?);
     // Refuse to replace an existing entry on both delete and restore.
     fs::hard_link(&item.path, &dest).map_err(|e| format!("无法移动会话（目标可能已存在）：{e}"))?;
@@ -300,15 +356,24 @@ pub fn read_import(install: &Install, p: &Profile, id: &str) -> Result<String, S
 
 pub fn preview(install: &Install, source: &Profile, target: &Profile) -> Result<Preview, String> {
     if source.id == target.id { return Err("来源和目标账号不能相同。".into()); }
-    let mut sessions: Vec<Session> = collect(&root(install, source))?.into_iter().map(|e| e.session).collect();
+    let mut sessions: Vec<Session> = collect_roots(&roots(install, source))?.into_iter().map(|e| e.session).collect();
     let store = target_store(install, target);
     if let Ok(dest) = &store {
+        let target_files = existing_target_files(install, target, dest)?;
         for s in &mut sessions {
             let name = s.id.rsplit('/').next().unwrap_or_default();
-            s.in_target = dest.join(name).exists();
+            s.in_target = target_files.contains(name);
         }
     }
     Ok(Preview { sessions, target_problem: store.err(), running: is_running(install, &[target]) })
+}
+
+fn existing_target_files(install: &Install, target: &Profile, dest: &Path) -> Result<std::collections::HashSet<String>, String> {
+    let target_org = dest.file_name();
+    let target_account = dest.parent().and_then(Path::file_name);
+    Ok(collect_roots(&roots(install, target))?.into_iter()
+        .filter(|e| Some(std::ffi::OsStr::new(&e.account)) == target_account && Some(std::ffi::OsStr::new(&e.org)) == target_org)
+        .map(|e| e.path.file_name().unwrap().to_string_lossy().into_owned()).collect())
 }
 
 fn replace_values(v: &mut Value, old_account: &str, old_org: &str, account: &str, org: &str) {
@@ -365,7 +430,12 @@ pub fn copy(install: &Install, source: &Profile, target: &Profile, ids: &[String
     let mut result = TransferResult { copied: 0, skipped: 0, failed: 0 };
     if !native.is_empty() {
         if is_running(install, &[target]) { return Err(format!("目标账号「{}」正在运行，需要重启后才能迁移本地会话。", target.name)); }
-        result = copy_into(&items, &target_store(install, target)?, &native)?;
+        let dest = target_store(install, target)?;
+        let existing = existing_target_files(install, target, &dest)?;
+        let (present, missing): (Vec<_>, Vec<_>) = native.into_iter().partition(|id|
+            items.iter().any(|e| &e.session.id == id) && existing.contains(id.rsplit('/').next().unwrap_or_default()));
+        result = copy_into(&items, &dest, &missing)?;
+        result.skipped += present.len();
     }
     if !imports.is_empty() {
         let dest = store_dir(&library(install, target, false, true), "archive", "chats")?;
@@ -450,6 +520,13 @@ mod tests {
         let store = store_dir(&root, "user", "org").unwrap();
         fs::write(store.join("local_example.json"), "{}").unwrap();
         assert_eq!(collect(&packaged_session_root(&local, family).unwrap()).unwrap().len(), 1);
+        let legacy = local.join("older").join("claude-code-sessions");
+        let old = store_dir(&legacy, "user", "org").unwrap();
+        fs::write(old.join("local_example.json"), "{}").unwrap();
+        fs::write(old.join("local_older.json"), "{}").unwrap();
+        let merged = collect_roots(&[root.clone(), legacy]).unwrap();
+        assert_eq!(merged.len(), 2);
+        assert!(merged.iter().any(|e| e.path == store.join("local_example.json")));
         assert!(packaged_session_root(&local, "Claude_other").is_none());
         assert!(!crate::install::valid_program_path(&root));
         fs::remove_dir_all(local).unwrap();
@@ -496,7 +573,7 @@ mod tests {
         fs::write(project.join(&name), b"original").unwrap();
         fs::write(project.join(&id).join("attachment"), b"sidecar").unwrap();
         fs::write(project.join("other.jsonl"), b"unrelated").unwrap();
-        let restore = || recover_projects(&root.join("claude-code-sessions"), &code, std::slice::from_ref(&source)).unwrap();
+        let restore = || recover_projects(&[root.join("claude-code-sessions")], &code, std::slice::from_ref(&source)).unwrap();
         restore();
         let target = code.join("projects/project");
         assert_eq!(fs::read(target.join(&name)).unwrap(), b"original");
