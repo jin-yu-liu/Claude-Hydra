@@ -68,7 +68,9 @@ pub fn launch(install: &Install, p: &Profile) -> Result<&'static str, String> {
         let port = crate::relay::port_for_launch(&p.id, node).map_err(|e| format!("账号未启动：{e}"))?;
         // Verify the exact route Claude will use: local relay -> node -> internet.
         let client = crate::node::relay_client(port, std::time::Duration::from_secs(15))?;
-        let exit = crate::node::inspect(&client, node).map_err(|e| format!("账号未启动：{e}"))?;
+        let found = crate::node::inspect_known(&client, node, None);
+        crate::guard::check_api_route(effective.environment.as_deref(), &found).map_err(|e| format!("账号未启动：{e}"))?;
+        let exit = found.into_result().map_err(|e| format!("账号未启动：{e}"))?;
         crate::guard::verify(effective.environment.as_deref(), &exit).map_err(|e| format!("账号未启动：{e}"))?;
         relay_port = Some(port);
         if matches!(effective.timezone.as_str(), "" | "proxy") {

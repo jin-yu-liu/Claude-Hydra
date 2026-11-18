@@ -296,6 +296,9 @@ fn geo_url(channel: &str, ip: IpAddr) -> String {
 /// Cloudflare's trace page in front of claude.ai: the exit IP and country exactly as the edge
 /// Claude talks to sees them.
 const EDGE_TRACE: &str = "https://claude.ai/cdn-cgi/trace";
+/// The same page in front of the API Claude Code talks to. A proxy that routes by domain can send
+/// it through another exit than claude.ai.
+const API_TRACE: &str = "https://api.anthropic.com/cdn-cgi/trace";
 
 /// `(ip, country)` from a Cloudflare trace body.
 fn parse_trace(body: &str) -> Option<(IpAddr, String)> {
@@ -314,6 +317,10 @@ pub struct Inspection {
     pub ip: Option<IpAddr>,
     /// Country Cloudflare's edge in front of claude.ai placed the exit in ("" = unknown).
     pub edge_country: String,
+    /// Exit IP as the API's edge sees it; `None` when that check did not answer.
+    pub api_ip: Option<IpAddr>,
+    /// Country the API's edge placed that exit in ("" = unknown).
+    pub api_country: String,
     /// The full result (IP, country, region, city, timezone), when the check finished.
     pub exit: Option<ExitInfo>,
     /// The location came from the previous verified exit because the IP did not change.
@@ -341,7 +348,18 @@ impl Inspection {
         format!("出口 IP {} 已确认，但位置服务都没有返回结果（{}）。", self.ip.map(|i| i.to_string()).unwrap_or_default(), failed("geo"))
     }
 
+    /// Why claude.ai and the API are proven to leave through different countries. Both countries
+    /// come from the same edge, and a rotating exit in one country is not a split.
+    pub fn api_split(&self) -> Option<String> {
+        let (main, api) = (self.ip?, self.api_ip?);
+        let (edge, other) = (self.edge_country.as_str(), self.api_country.as_str());
+        (main != api && !edge.is_empty() && !other.is_empty() && edge != other).then(|| format!(
+            "claude.ai 和 Claude API 走了不同国家的出口（{edge} 与 {other}），代理可能在按域名分流。请让 Claude 的全部流量走同一个节点。"
+        ))
+    }
+
     pub fn into_result(self) -> Result<ExitInfo, String> {
+        if let Some(reason) = self.api_split() { return Err(reason); }
         match self.exit { Some(exit) => Ok(exit), None => Err(self.failure()) }
     }
 }
@@ -379,6 +397,14 @@ pub fn inspect_known(client: &reqwest::blocking::Client, node: &NodeConfig, know
         }
     }
     let Some(ip) = out.ip else { return out };
+    // Optional: an API edge that does not answer says nothing about the route.
+    if let Some(body) = attempt(client, &route, "api", API_TRACE, 4096, &mut out.attempts) {
+        match parse_trace(&body) {
+            Some((api, country)) if wanted(&api) => { out.api_ip = Some(api); out.api_country = country; }
+            Some(_) => reject(&mut out.attempts, if v6 { "返回的是 IPv4 地址" } else { "返回的是 IPv6 地址" }),
+            None => reject(&mut out.attempts, "返回了无法识别的数据"),
+        }
+    }
     if let Some(known) = known.filter(|k| k.ip.parse::<IpAddr>().ok() == Some(ip) && !k.country.trim().is_empty()) {
         out.exit = Some(ExitInfo { checked_at: crate::paths::now_millis(), ..known.clone() });
         out.reused = true;
@@ -565,6 +591,24 @@ mod tests {
     }
 
     #[test]
+    fn only_different_countries_split_the_api_route() {
+        let found = |main: &str, edge: &str, api: &str, country: &str| Inspection {
+            ip: Some(main.parse().unwrap()),
+            edge_country: edge.into(),
+            api_ip: Some(api.parse().unwrap()),
+            api_country: country.into(),
+            exit: Some(ExitInfo { ip: main.into(), country: edge.into(), ..Default::default() }),
+            ..Default::default()
+        };
+        let split = found("192.0.2.1", "JP", "192.0.2.2", "US");
+        assert!(split.api_split().unwrap().contains("JP 与 US"));
+        assert!(split.into_result().is_err());
+        assert!(found("192.0.2.1", "JP", "192.0.2.2", "JP").into_result().is_ok(), "a rotating exit is not a split");
+        assert!(found("192.0.2.1", "JP", "192.0.2.1", "US").api_split().is_none(), "one IP is one exit");
+        assert!(found("192.0.2.1", "", "192.0.2.2", "US").api_split().is_none(), "nothing to compare");
+    }
+
+    #[test]
     fn unreachable_node_reports_every_service_and_rate_limits_are_skipped() {
         // Nothing listens on the node's port: every request fails to connect.
         let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
@@ -633,7 +677,7 @@ mod tests {
         // Same IP again: the location is reused, no location service is asked.
         let again = inspect_known(&client, &node, Some(&exit));
         println!("recheck trail: {}", again.trail());
-        assert!(again.reused && again.attempts.iter().all(|a| a.stage == "ip"));
+        assert!(again.reused && again.attempts.iter().all(|a| a.stage != "geo"));
         assert_eq!(again.exit.map(|x| x.country), Some(exit.country.clone()));
         println!("Network classification: {:?}", network_quality(&client, &exit.ip));
         println!("{}", reputation(&client, &exit.ip));

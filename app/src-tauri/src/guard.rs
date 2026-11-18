@@ -99,9 +99,29 @@ pub enum Verdict {
     Unverified(String),
 }
 
+/// Checks the route the API took, which Claude Code depends on, when its edge answered.
+pub fn check_api_route(env_id: Option<&str>, found: &Inspection) -> Result<(), String> {
+    check_api(&environment(env_id), found)
+}
+
+fn check_api(env: &Environment, found: &Inspection) -> Result<(), String> {
+    if let Some(reason) = found.api_split() { return Err(reason); }
+    let Some(api) = found.api_ip else { return Ok(()) };
+    if !env.allow_cn {
+        if let Some((_, name)) = UNSUPPORTED.iter().find(|(code, _)| found.api_country.eq_ignore_ascii_case(code)) {
+            return Err(format!("Claude API 的出口 {api} 位于{name}，Claude 不在该地区提供服务，已拦截。"));
+        }
+    }
+    if env.exit_rule == "static" && found.ip.is_some_and(|ip| ip != api) {
+        return Err(format!("Claude API 的出口 {api} 与 claude.ai 的出口不同，不符合“固定 IP”规则。"));
+    }
+    Ok(())
+}
+
 /// Judges a route check against environment `env_id`.
 pub fn judge(env_id: Option<&str>, found: &Inspection) -> Verdict {
     let env = environment(env_id);
+    if let Err(reason) = check_api(&env, found) { return Verdict::Violation(reason); }
     if let Some(exit) = &found.exit {
         if let Err(reason) = check(&env, exit) { return Verdict::Violation(reason); }
         return match bind_first(env_id, &env, exit) {
@@ -240,6 +260,24 @@ mod tests {
         assert!(check(&env, &exit("1.1.1.2", "US", "", "")).is_err());
         env.exit_rule.clear();
         assert!(check(&env, &exit("1.1.1.2", "US", "", "")).is_ok());
+    }
+
+    #[test]
+    fn the_api_route_follows_the_exit_rules() {
+        let found = |api: &str, country: &str| Inspection {
+            api_ip: Some(api.parse().unwrap()),
+            api_country: country.into(),
+            ..partial(Some("192.0.2.1"), "JP")
+        };
+        let open = Environment::default();
+        assert!(check_api(&open, &found("192.0.2.2", "JP")).is_ok());
+        assert!(check_api(&open, &found("192.0.2.2", "US")).is_err());
+        assert!(check_api(&open, &found("192.0.2.1", "HK")).is_err());
+        assert!(check_api(&Environment { allow_cn: true, ..Default::default() }, &found("192.0.2.1", "HK")).is_ok());
+        let fixed = Environment { exit_rule: "static".into(), ..Default::default() };
+        assert!(check_api(&fixed, &found("192.0.2.1", "JP")).is_ok());
+        assert!(check_api(&fixed, &found("192.0.2.2", "JP")).is_err());
+        assert!(check_api(&fixed, &partial(Some("192.0.2.1"), "JP")).is_ok(), "no answer from the API edge decides nothing");
     }
 
     fn partial(ip: Option<&str>, edge: &str) -> Inspection {
