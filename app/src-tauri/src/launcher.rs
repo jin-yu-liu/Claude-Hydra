@@ -142,31 +142,38 @@ pub fn launch(install: &Install, p: &Profile) -> Result<&'static str, String> {
         pass.extend(managed);
         pass.extend(extra.split_whitespace().map(str::to_string));
         if sandboxed {
-            // macOS isolation: a Seatbelt profile denies everything except loopback, so the only
-            // way out is the account's relay. The profile is proven before Claude starts; a check
-            // that does not hold refuses the launch instead of running unconfined.
-            let profile = crate::macos::configure(&p.id, relay_port).map_err(|e| format!("账号未启动：{e}"))?;
-            crate::macos::verify(&profile, relay_port).map_err(|e| format!("账号未启动：{e}"))?;
+            // The profile is proven before Claude starts; a check that does not hold refuses the
+            // launch instead of running unconfined.
             let exe = install.launch_exe().ok_or("找不到 Claude 的启动程序。Claude 可能正在更新，请稍后再试。")?;
-            // Page fingerprint: Claude is Electron, so a DevTools port lets the account's
-            // Canvas/WebGL/font/screen script in before the first page runs. Only accounts with
-            // their own data directory have a place for the port file.
-            let debug_port = if p.is_default { None } else { crate::macos::free_port() };
-            if let Some(port) = debug_port {
-                pass.push(format!("--remote-debugging-port={port}"));
-            }
-            if debug_port.is_some() {
-                crate::macos::clear_devtools_port(&path);
-            }
+            let mut files = crate::macos::Files {
+                denied: vec![paths::storage_root()],
+                allowed: vec![path.clone()],
+                startup: std::env::var_os("HOME").map(|home| crate::macos::startup_paths(home.as_ref())).unwrap_or_default(),
+                link_opener: Some(exe.clone()),
+            };
+            files.denied.extend(
+                profiles::ids(install).iter().filter(|id| **id != p.id).map(|id| profiles::profile_path(install, id)),
+            );
+            files.allowed.extend(code_dir.clone());
+            let profile = crate::macos::configure(&p.id, relay_port, &files).map_err(|e| format!("账号未启动：{e}"))?;
+            let settings_file = Some(paths::settings_path()).filter(|f| f.is_file());
+            crate::macos::verify(&profile, relay_port, &path, settings_file.as_deref()).map_err(|e| format!("账号未启动：{e}"))?;
+            pass.push(crate::macos::CHROMIUM_SWITCH.into());
+            let stderr_path = paths::logs_dir().join(format!("launch-{}.log", safe_file_name(&p.id)));
+            let stderr = std::fs::create_dir_all(paths::logs_dir())
+                .and_then(|_| std::fs::File::create(&stderr_path))
+                .map(Stdio::from)
+                .unwrap_or_else(|_| Stdio::null());
             let mut cmd = crate::macos::command(&profile, &exe, &pass, &env);
-            cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+            cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(stderr);
             let mut child = cmd.spawn().map_err(|e| format!("无法启动 Claude：{e}"))?;
+            let result = confirm_started(install, p, &mut child, &stderr_path);
             // `sandbox-exec` execs Claude in place, so this is Claude itself: reap it when it quits.
             std::thread::spawn(move || { let _ = child.wait(); });
-            if !p.is_default {
-                crate::macos::inject_fingerprint(PathBuf::from(p.path.clone()), crate::browser::fingerprint_script(&p.id));
+            if let Err(e) = &result {
+                paths::append_log("hydra-error.log", &format!("launch {}: {e}", p.id));
             }
-            return confirm_running(install, p).map(|_| outcome);
+            return result.map(|_| outcome);
         }
         let mut cmd = Command::new("/usr/bin/open");
         cmd.args(["-n", "-a", &app]);
@@ -259,7 +266,6 @@ fn confirm_boxed(install: &Install, p: &Profile) -> Result<(), String> {
     ))
 }
 
-#[cfg(not(target_os = "macos"))]
 fn safe_file_name(s: &str) -> String {
     s.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect()
 }
@@ -267,7 +273,6 @@ fn safe_file_name(s: &str) -> String {
 /// Waits for the account's Claude main process to appear and survive a moment. Store builds
 /// are started through an app execution alias whose own process exits right away, so the
 /// spawned child's exit alone proves nothing; only its non-zero exit code is used as a hint.
-#[cfg(not(target_os = "macos"))]
 fn confirm_started(
     install: &Install,
     p: &Profile,

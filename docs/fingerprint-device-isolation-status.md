@@ -17,7 +17,7 @@
 
 理解 B（虚拟机级隔离）没有做，也不打算用 Sandboxie 冒充。Sandboxie 是进程沙箱，不是虚拟机：它不虚拟化内核，因此 CPU 型号、内存大小、显卡与驱动版本仍与主机一致，账号浏览器以外的浏览器（用户自己的 Chrome / Edge）、Claude Code 命令行本身也不经过网页指纹脚本，见「没有覆盖到的部分」。
 
-macOS 没有 Sandboxie 的对等物：那边做到的是内核级网络强制（Seatbelt）、Keychain 密码，以及通过 DevTools 注入到 Claude 渲染进程的网页指纹；主机名、MAC、`IOPlatformUUID`、序列号等系统级硬件标识仍是主机值。实现、验收步骤与边界见 [macos-isolation-status.md](macos-isolation-status.md)。
+macOS 没有 Sandboxie 的对等物：那边做到的是 Seatbelt 网络强制与账号间文件限制、Keychain 密码，以及账号浏览器的网页指纹；主机名、MAC、`IOPlatformUUID`、序列号等系统级硬件标识仍是主机值。详见 [macos-isolation-status.md](macos-isolation-status.md)。
 
 ## 这项任务指什么
 

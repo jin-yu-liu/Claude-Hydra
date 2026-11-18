@@ -155,7 +155,7 @@ export function EnvironmentDialog({ open, id, initial, detectedTimezone, exitBas
             <p className="px-4 pb-3 text-[11.5px] leading-relaxed text-muted">
               {env.isolation === "sandboxie"
                 ? (IS_MAC
-                  ? "启动前用 macOS 的 Seatbelt 沙盒验证：沙盒内只能连接本机回环（中继），直连外部地址会被内核拒绝，验证不通过就不启动。账号浏览页的 Canvas / WebGL / GPU / 字体测量 / 屏幕等网页指纹按账号派生（尽力而为，需要 Claude 提供调试端口，失败会记录日志）。注意：主机名、网卡 MAC、IOPlatformUUID、序列号等系统级硬件标识仍与主机相同——macOS 不像 Sandboxie 那样能按进程改写这些内核值，只有虚拟机才能完全隔离。"
+                  ? "绑定节点后，Claude 及其启动的程序只能连接本账号的本地中继，直连、其他本机端口和系统 DNS 都会被内核拒绝，启动前会自检。账号也不能读取其他账号和 Hydra 的数据，沙盒内的工具不能启动其他应用或写入开机启动项。代价：macOS 不允许沙箱嵌套，Claude 必须以 --no-sandbox 运行，网页一旦被攻击，影响范围会比平时大。主机名、网卡 MAC、序列号等硬件标识仍与主机相同。"
                   : "沙箱中只允许连接本账号的本地中继，任何绕过代理的进程都会断网；文件和注册表写入留在沙箱内（账号数据目录除外）。沙箱内无法经本机 DNS 解析外部域名，域名只经代理解析。商店版会先复制一份到 Hydra 数据目录再装入沙箱（首次较慢）；系统默认账号不能使用环境。启动后会核实 Claude 确实在沙箱中运行，否则立即关闭。")
                 : "不用沙箱时：Claude 与它启动的工具都经本地中继出网（无直连回退），出口不合规则时会自动断网；但忽略代理设置的程序仍可能直连。"}
               {sandbox && !sandbox.ok && <span className="block text-warn">{sandbox.text}</span>}

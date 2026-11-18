@@ -1,7 +1,7 @@
 //! Optional per-account isolation, opt-in per environment: a Sandboxie-Plus box on Windows, or a
 //! Seatbelt profile (`macos.rs`) on macOS. The Windows box also virtualizes files and the
-//! registry; the macOS profile only confines the network and verifies that confinement before the
-//! account starts.
+//! registry; the macOS profile confines the network and keeps the account out of other accounts'
+//! data, and is verified before the account starts.
 //!
 //! Without a box, Claude's network is routed through the account's relay by Chromium switches
 //! and proxy variables, which a process may ignore. Inside a box, Sandboxie enforces it:

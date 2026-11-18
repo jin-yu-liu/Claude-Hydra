@@ -1,42 +1,47 @@
-//! macOS isolation: a Seatbelt profile for the network, and the DevTools channel that puts the
-//! account's page fingerprint into Claude's renderer.
+//! macOS isolation: a per-account Seatbelt profile applied with `sandbox-exec`.
 //!
-//! This module is compiled on every platform so its Rust is checked where it is written; only the
-//! macOS build calls it. The two mechanisms are deliberately separate:
+//! Every process Claude starts inherits the profile, so a program that ignores the proxy settings
+//! still cannot leave except through the account's relay. The profile also keeps the account out
+//! of other accounts' data and Hydra's own settings.
 //!
-//! - **Network**: `sandbox-exec` applies a per-account profile (inherited by every child process)
-//!   that denies outbound connections except to the account's relay port on loopback. The
-//!   profile is *verified* before the account is started: if a direct connection, or a connection
-//!   to any other loopback port, still succeeds, the launch is refused. `sandbox-exec` is
-//!   deprecated by Apple but still shipped; when it is missing the caller reports that isolation
-//!   is unavailable instead of silently running unconfined.
-//! - **Page fingerprint**: Claude Desktop is Electron. Started with a remote-debugging port it
-//!   accepts a DevTools connection on loopback, which installs the same per-account Canvas /
-//!   WebGL / font / screen shim the Windows account browser uses. The script lives as long as the
-//!   DevTools session that installed it, so each page's session is held open. This needs no code
-//!   signing and no SIP change, but it is script-level: if Claude does not expose the port, the
-//!   fingerprint is simply not applied (logged), and anything the process reads outside its
-//!   renderer still sees the host.
+//! macOS refuses to initialize a sandbox inside one already applied, and Chromium sandboxes each
+//! of its child processes, so Claude only runs here with `--no-sandbox`. That removes the renderer
+//! sandbox around the claude.ai page; the file rules limit what a compromised page could reach.
 //!
-//! Hardware identifiers (`IOPlatformUUID`, serial numbers, the real MAC addresses) are *not*
-//! touched: on macOS those are kernel values a process cannot rewrite without injection, and no
-//! equivalent of Sandboxie's virtualization exists. The status document says so.
+//! A process started through LaunchServices or Apple Events runs outside the profile, so only
+//! Claude's main process, which opens sign-in links, may use LaunchServices. Login items and shell
+//! start-up files would likewise run later outside the profile, so they cannot be written.
+//! `sandbox-exec` is deprecated by Apple but still shipped; without it isolation is reported as
+//! unavailable instead of the account running unconfined.
+//!
+//! Hardware identifiers (`IOPlatformUUID`, serial numbers, MAC addresses) stay the host's.
 
-#![allow(dead_code)]
-
-use crate::macos_isolation::{
-    cdp_commands, devtools_port, handshake_request, masked_frame, page_targets, read_frame, reload_command, reply_to,
-    seatbelt_profile, Target, INSTALL_ID,
-};
-use std::collections::HashSet;
-use std::io::{Read, Write};
-use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{Duration, Instant};
 
 const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 const NC: &str = "/usr/bin/nc";
+
+/// Chromium cannot create its own sandboxes inside Seatbelt (see the module note).
+pub const CHROMIUM_SWITCH: &str = "--no-sandbox";
+
+/// What the account may not touch, and the folders of its own inside those.
+#[derive(Debug, Default)]
+pub struct Files {
+    pub denied: Vec<PathBuf>,
+    pub allowed: Vec<PathBuf>,
+    /// Start-up locations whose contents would later run outside the profile.
+    pub startup: Vec<PathBuf>,
+    /// The one executable allowed to open links and apps through LaunchServices.
+    pub link_opener: Option<PathBuf>,
+}
+
+/// Where a program could leave something that runs at the next login or shell start.
+pub fn startup_paths(home: &Path) -> Vec<PathBuf> {
+    ["Library/LaunchAgents", ".zshrc", ".zprofile", ".zshenv", ".zlogin", ".bashrc", ".bash_profile", ".profile"]
+        .map(|p| home.join(p))
+        .into()
+}
 
 /// The macOS isolation tool, or a user-facing reason it cannot be used.
 pub fn available() -> Result<PathBuf, String> {
@@ -55,13 +60,52 @@ pub fn profile_path(id: &str) -> PathBuf {
     profile_dir().join(format!("{}.sb", crate::sandbox::account_key(id)))
 }
 
-/// Writes the account's profile. `relay_port = None` (no proxy node) leaves the network
-/// unrestricted, matching the Windows box which only narrows the network when a relay exists.
-pub fn configure(id: &str, relay_port: Option<u16>) -> Result<PathBuf, String> {
+/// Seatbelt compares resolved paths, so `/tmp/x` must be written as `/private/tmp/x`.
+fn quoted(path: &Path) -> String {
+    let real = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    format!("\"{}\"", real.to_string_lossy().replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+/// The profile text. With a relay, the only network exit is that one loopback port: a host proxy
+/// or another account's relay also listens on loopback, and the system DNS service would resolve
+/// names outside the node. Without a relay the network stays open, like the Windows box.
+///
+/// Reading metadata stays allowed so paths through the denied folders still resolve. The allow
+/// rules name `file-read-data` because a broader `file-read*` does not override that denial.
+pub fn seatbelt_profile(relay_port: Option<u16>, files: &Files) -> String {
+    let mut profile = String::from("(version 1)\n(allow default)\n");
+    if let Some(port) = relay_port {
+        profile.push_str("(deny network-outbound)\n");
+        profile.push_str("(allow network-outbound (remote unix-socket (path-regex #\"^/\")))\n");
+        profile.push_str("(deny network-outbound (remote unix-socket (path-literal \"/private/var/run/mDNSResponder\")))\n");
+        profile.push_str("(deny mach-lookup (global-name \"com.apple.dnssd.service\"))\n");
+        // Seatbelt accepts only `*` or `localhost` as the host here, never a numeric address.
+        profile.push_str(&format!("(allow network-outbound (remote ip \"localhost:{port}\"))\n"));
+    }
+    for path in &files.denied {
+        profile.push_str(&format!("(deny file-read-data file-write* (subpath {}))\n", quoted(path)));
+    }
+    for path in &files.allowed {
+        profile.push_str(&format!("(allow file-read-data file-write* (subpath {}))\n", quoted(path)));
+    }
+    for path in &files.startup {
+        profile.push_str(&format!("(deny file-write* (subpath {}))\n", quoted(path)));
+    }
+    profile.push_str("(deny appleevent-send)\n");
+    match &files.link_opener {
+        // Matched by path: a signing identifier can be copied by an ad-hoc signed program.
+        Some(exe) => profile.push_str(&format!("(deny lsopen (require-not (process-path {})))\n", quoted(exe))),
+        None => profile.push_str("(deny lsopen)\n"),
+    }
+    profile
+}
+
+/// Writes the account's profile.
+pub fn configure(id: &str, relay_port: Option<u16>, files: &Files) -> Result<PathBuf, String> {
     available()?;
     std::fs::create_dir_all(profile_dir()).map_err(|e| format!("无法创建 macOS 沙盒配置目录：{e}"))?;
     let path = profile_path(id);
-    std::fs::write(&path, seatbelt_profile(relay_port)).map_err(|e| format!("无法写入 macOS 沙盒配置：{e}"))?;
+    std::fs::write(&path, seatbelt_profile(relay_port, files)).map_err(|e| format!("无法写入 macOS 沙盒配置：{e}"))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -70,7 +114,7 @@ pub fn configure(id: &str, relay_port: Option<u16>) -> Result<PathBuf, String> {
     Ok(path)
 }
 
-fn probe(profile: &Path, program: &str, args: &[&str]) -> Result<std::process::Output, String> {
+fn probe(profile: &Path, program: &str, args: &[&std::ffi::OsStr]) -> Result<std::process::Output, String> {
     Command::new(SANDBOX_EXEC)
         .arg("-f")
         .arg(profile)
@@ -80,12 +124,16 @@ fn probe(profile: &Path, program: &str, args: &[&str]) -> Result<std::process::O
         .map_err(|e| format!("无法运行 macOS 沙盒自检：{e}"))
 }
 
-/// Proves the profile works before the account starts: it loads, the relay is reachable, any
-/// other loopback port is refused (a host proxy such as Clash would otherwise be a way out) and a
-/// direct connection is refused. Anything else refuses the launch. Without a relay the profile has
-/// no network rules (there is no exit to send the account through), so only the load check
-/// applies - the same behaviour as the Windows box.
-pub fn verify(profile: &Path, relay_port: Option<u16>) -> Result<(), String> {
+fn connects(profile: &Path, host: &str, port: u16) -> Result<bool, String> {
+    let port = port.to_string();
+    let args = ["-z", "-w", "2", host, port.as_str()].map(std::ffi::OsStr::new);
+    Ok(probe(profile, NC, &args)?.status.success())
+}
+
+/// Proves the profile before the account starts: it loads, the account can read its own folder
+/// but not `protected`, the relay is reachable, and neither another loopback port nor a direct
+/// connection is. Anything else refuses the launch.
+pub fn verify(profile: &Path, relay_port: Option<u16>, own: &Path, protected: Option<&Path>) -> Result<(), String> {
     let loaded = probe(profile, "/usr/bin/true", &[])?;
     if !loaded.status.success() {
         return Err(format!(
@@ -93,22 +141,28 @@ pub fn verify(profile: &Path, relay_port: Option<u16>) -> Result<(), String> {
             String::from_utf8_lossy(&loaded.stderr).trim()
         ));
     }
+    if !probe(profile, "/bin/ls", &[own.as_os_str()])?.status.success() {
+        return Err("macOS 沙盒自检失败：账号读不到自己的数据目录，已停止启动。".into());
+    }
+    if let Some(path) = protected {
+        if probe(profile, "/bin/cat", &[path.as_os_str()])?.status.success() {
+            return Err("macOS 沙盒自检失败：沙盒内仍能读取 Hydra 的配置，已停止启动。".into());
+        }
+    }
     let Some(port) = relay_port else { return Ok(()) };
-    let relay = probe(profile, NC, &["-z", "-w", "2", "127.0.0.1", &port.to_string()])?;
-    if !relay.status.success() {
+    if !connects(profile, "127.0.0.1", port)? {
         return Err("macOS 沙盒自检失败：本机中继在沙盒内不可达，已停止启动，避免 Claude 在无可达出口的情况下运行。".into());
     }
     // A listener of our own, outside the sandbox: the kernel completes the connection from its
     // backlog, so `nc -z` succeeds exactly when the profile lets the sandbox reach that port.
     let other = std::net::TcpListener::bind(("127.0.0.1", 0)).map_err(|e| format!("无法运行 macOS 沙盒自检：{e}"))?;
     let other_port = other.local_addr().map_err(|e| format!("无法运行 macOS 沙盒自检：{e}"))?.port();
-    let loopback = probe(profile, NC, &["-z", "-w", "2", "127.0.0.1", &other_port.to_string()])?;
+    let loopback = connects(profile, "127.0.0.1", other_port)?;
     drop(other);
-    if loopback.status.success() {
+    if loopback {
         return Err("macOS 沙盒自检失败：沙盒内仍能连到本机中继以外的端口（例如本机代理），已停止启动，避免 Claude 绕开账号中继。".into());
     }
-    let direct = probe(profile, NC, &["-z", "-w", "2", "1.1.1.1", "443"])?;
-    if direct.status.success() {
+    if connects(profile, "1.1.1.1", 443)? {
         return Err("macOS 沙盒自检失败：沙盒内仍能直连外部地址，已停止启动，避免 Claude 绕开代理走主机网络。".into());
     }
     Ok(())
@@ -124,163 +178,89 @@ pub fn command(profile: &Path, exe: &Path, args: &[String], env: &[(String, Stri
     cmd
 }
 
-/// A free loopback port for the DevTools endpoint.
-pub fn free_port() -> Option<u16> {
-    std::net::TcpListener::bind(("127.0.0.1", 0)).ok()?.local_addr().ok().map(|addr| addr.port())
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-// ---- page fingerprint ----------------------------------------------------------------
-
-/// Removes the port file a previous run left behind, so the watcher cannot read a stale port
-/// (by now possibly another process's). Called before Claude is started.
-pub fn clear_devtools_port(data_dir: &Path) {
-    let _ = std::fs::remove_file(data_dir.join("DevToolsActivePort"));
-}
-
-/// Watches Claude's DevTools endpoint for as long as it lives and installs the account's
-/// fingerprint script in every page that appears. The script belongs to the DevTools session that
-/// installed it, so each page keeps its own connection open until the page goes away. A Claude
-/// that never opens the port, or a page that refuses the install, is logged and left untouched.
-pub fn inject_fingerprint(data_dir: PathBuf, script: String) {
-    std::thread::spawn(move || watch(&data_dir, &script));
-}
-
-fn watch(data_dir: &Path, script: &str) {
-    // The port file appears once Claude's browser process is up.
-    let mut port = None;
-    for _ in 0..40 {
-        port = std::fs::read_to_string(data_dir.join("DevToolsActivePort")).ok().and_then(|text| devtools_port(&text));
-        if port.is_some() { break; }
-        std::thread::sleep(Duration::from_millis(500));
-    }
-    let Some(port) = port else {
-        crate::paths::append_log(
-            "hydra-error.log",
-            "account browser fingerprint: Claude exposed no DevTools port; page fingerprint not applied",
-        );
-        return;
-    };
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut failures = 0u32;
-    // Until the endpoint stops answering: Claude has quit, and every page session with it.
-    while failures < 30 {
-        match http_get(port, "/json/list") {
-            Some(list) => {
-                failures = 0;
-                for target in page_targets(&list) {
-                    if !seen.insert(target.socket.clone()) { continue; }
-                    match attach(port, &target, script) {
-                        Ok(()) => crate::paths::append_log(
-                            "hydra.log",
-                            &format!("account browser fingerprint: installed in page {}", short_url(&target.url)),
-                        ),
-                        Err(reason) => crate::paths::append_log(
-                            "hydra-error.log",
-                            &format!("account browser fingerprint: not installed in page {}: {reason}", short_url(&target.url)),
-                        ),
-                    }
-                }
-            }
-            None => failures += 1,
-        }
-        std::thread::sleep(Duration::from_millis(700));
-    }
-}
-
-/// Scheme and host only: the log should not carry conversation paths or query strings.
-fn short_url(url: &str) -> String {
-    match url.split_once("://") {
-        Some((scheme, rest)) => format!("{scheme}://{}", rest.split(['/', '?', '#']).next().unwrap_or_default()),
-        None => url.chars().take(40).collect(),
-    }
-}
-
-fn http_get(port: u16, path: &str) -> Option<String> {
-    let mut stream = TcpStream::connect(("127.0.0.1", port)).ok()?;
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-    write!(stream, "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n").ok()?;
-    let mut text = String::new();
-    stream.read_to_string(&mut text).ok()?;
-    let (_, body) = text.split_once("\r\n\r\n")?;
-    Some(body.to_string())
-}
-
-fn send(stream: &mut TcpStream, opcode: u8, payload: &[u8]) -> std::io::Result<()> {
-    let mask = random::<4>().unwrap_or([1, 2, 3, 4]);
-    stream.write_all(&masked_frame(opcode, payload, mask))
-}
-
-/// Opens a DevTools session on the page, installs the script, waits for Chromium to confirm it,
-/// reloads a web page so the document already showing gets it too, and hands the session to a
-/// thread that keeps it open (answering pings) until the page closes.
-fn attach(port: u16, target: &Target, script: &str) -> Result<(), String> {
-    let rest = target.socket.strip_prefix("ws://").unwrap_or(&target.socket);
-    let path = rest.find('/').map(|slash| &rest[slash..]).ok_or("bad debugger url")?;
-    let mut stream = TcpStream::connect(("127.0.0.1", port)).map_err(|e| format!("connect: {e}"))?;
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-    let key = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, random::<16>().unwrap_or([0u8; 16]));
-    stream
-        .write_all(handshake_request("127.0.0.1", port, path, &key).as_bytes())
-        .map_err(|e| format!("handshake: {e}"))?;
-    // Byte-wise so the header read does not consume the first frame.
-    let mut header = Vec::new();
-    let mut byte = [0u8; 1];
-    loop {
-        stream.read_exact(&mut byte).map_err(|e| format!("handshake: {e}"))?;
-        header.push(byte[0]);
-        if header.ends_with(b"\r\n\r\n") { break; }
-        if header.len() > 8192 { return Err("handshake: header too long".into()); }
-    }
-    let header = String::from_utf8_lossy(&header);
-    if !header.starts_with("HTTP/1.1 101") {
-        return Err(format!("handshake refused: {}", header.lines().next().unwrap_or_default()));
-    }
-    for message in cdp_commands(script) {
-        send(&mut stream, 1, message.as_bytes()).map_err(|e| format!("send: {e}"))?;
-    }
-    // Events (from Page.enable) may arrive first; only the install's own reply counts.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        if Instant::now() > deadline { return Err("no reply to the install".into()); }
-        let frame = read_frame(&mut stream)
-            .map_err(|e| format!("read: {e}"))?
-            .ok_or("closed before the install was confirmed")?;
-        match frame.opcode {
-            8 => return Err("closed before the install was confirmed".into()),
-            9 => send(&mut stream, 10, &frame.payload).map_err(|e| format!("pong: {e}"))?,
-            _ => match reply_to(&frame.payload, INSTALL_ID) {
-                Some(true) => break,
-                Some(false) => return Err(format!("install refused: {}", String::from_utf8_lossy(&frame.payload))),
-                None => {}
-            },
+    fn files() -> Files {
+        Files {
+            denied: vec!["/no/hydra".into(), "/no/Cl\"aude".into()],
+            allowed: vec!["/no/hydra/profiles/a".into()],
+            startup: startup_paths(Path::new("/no/home")),
+            link_opener: Some("/no/Claude".into()),
         }
     }
-    if target.reload_after_install() {
-        send(&mut stream, 1, reload_command().as_bytes()).map_err(|e| format!("reload: {e}"))?;
-    }
-    let _ = stream.set_read_timeout(None);
-    std::thread::spawn(move || keep_open(stream));
-    Ok(())
-}
 
-/// Holds the page's DevTools session (and with it the installed script) until the page or Claude
-/// closes it. Events are read and dropped; pings are answered so the session stays up.
-fn keep_open(mut stream: TcpStream) {
-    loop {
-        match read_frame(&mut stream) {
-            Ok(Some(frame)) if frame.opcode == 8 => break,
-            Ok(Some(frame)) if frame.opcode == 9 => {
-                if send(&mut stream, 10, &frame.payload).is_err() { break; }
-            }
-            Ok(Some(_)) => {}
-            Ok(None) | Err(_) => break,
+    #[test]
+    fn a_relay_is_the_only_network_exit() {
+        let text = seatbelt_profile(Some(4242), &Files::default());
+        assert!(text.contains("(deny network-outbound)"));
+        assert!(text.contains("(allow network-outbound (remote ip \"localhost:4242\"))"));
+        assert!(text.contains("/private/var/run/mDNSResponder"));
+        assert!(text.contains("com.apple.dnssd.service"));
+        assert!(!text.contains("localhost:*"));
+    }
+
+    #[test]
+    fn without_a_relay_only_files_are_limited() {
+        let text = seatbelt_profile(None, &files());
+        assert!(!text.contains("network-outbound"));
+        assert!(text.contains("(deny file-read-data file-write* (subpath \"/no/hydra\"))"));
+    }
+
+    #[test]
+    fn the_accounts_own_folder_is_opened_after_the_denials() {
+        let text = seatbelt_profile(None, &files());
+        let denied = text.find("(deny file-read-data file-write* (subpath \"/no/hydra\"))").unwrap();
+        let allowed = text.find("(allow file-read-data file-write* (subpath \"/no/hydra/profiles/a\"))").unwrap();
+        assert!(denied < allowed);
+        assert!(text.contains("\"/no/Cl\\\"aude\""));
+    }
+
+    #[test]
+    fn only_claude_can_start_programs_outside_the_profile() {
+        let text = seatbelt_profile(None, &files());
+        assert!(text.contains("(deny appleevent-send)"));
+        assert!(text.contains("(deny lsopen (require-not (process-path \"/no/Claude\")))"));
+        for item in ["Library/LaunchAgents", ".zshrc"] {
+            let path = Path::new("/no/home").join(item);
+            assert!(text.contains(&format!("(deny file-write* (subpath {}))", quoted(&path))));
         }
+        assert!(seatbelt_profile(None, &Files::default()).contains("(deny lsopen)"));
     }
-}
 
-fn random<const N: usize>() -> Option<[u8; N]> {
-    let mut out = [0u8; N];
-    let mut file = std::fs::File::open("/dev/urandom").ok()?;
-    file.read_exact(&mut out).ok()?;
-    Some(out)
+    /// Runs the real `sandbox-exec`, which cannot start inside another sandbox.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "needs a shell outside any macOS sandbox"]
+    fn the_kernel_enforces_the_profile() {
+        let root = std::env::temp_dir().join(format!("hydra-seatbelt-{}", crate::paths::now_millis()));
+        let (own, other) = (root.join("profiles/a"), root.join("profiles/b"));
+        std::fs::create_dir_all(&own).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let settings = root.join("settings.json");
+        std::fs::write(&settings, "{}").unwrap();
+        std::fs::write(other.join("Cookies"), "x").unwrap();
+        let relay = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = relay.local_addr().unwrap().port();
+        let startup = own.join("Library/LaunchAgents");
+        std::fs::create_dir_all(&startup).unwrap();
+        let files = Files { denied: vec![root.clone()], allowed: vec![own.clone()], startup: vec![startup.clone()], link_opener: None };
+        let profile = root.join("a.sb");
+        std::fs::write(&profile, seatbelt_profile(Some(port), &files)).unwrap();
+
+        verify(&profile, Some(port), &own, Some(&settings)).unwrap();
+        assert!(!probe(&profile, "/bin/cat", &[other.join("Cookies").as_os_str()]).unwrap().status.success());
+
+        let item = startup.join("item.plist");
+        assert!(!probe(&profile, "/usr/bin/touch", &[item.as_os_str()]).unwrap().status.success());
+        let opened = probe(&profile, "/usr/bin/open", &["-g".as_ref(), own.as_os_str()]).unwrap();
+        assert!(!opened.status.success());
+        assert!(String::from_utf8_lossy(&opened.stderr).contains("-54"));
+
+        // A profile that leaves the settings readable must stop the launch.
+        std::fs::write(&profile, seatbelt_profile(Some(port), &Files::default())).unwrap();
+        assert!(verify(&profile, Some(port), &own, Some(&settings)).is_err());
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

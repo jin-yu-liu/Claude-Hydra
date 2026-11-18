@@ -11,7 +11,6 @@ pub mod login;
 #[cfg(target_os = "macos")]
 mod mac_url;
 pub mod macos;
-pub mod macos_isolation;
 pub mod paths;
 pub mod profiles;
 pub mod node;

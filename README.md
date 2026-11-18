@@ -43,7 +43,7 @@
 | 多账号并行 | 通过 `--user-data-dir` 为每个账号提供独立的配置与登录态，可同时打开多个 Claude 窗口 |
 | 环境配置 | 把代理节点、时区、窗口语言、启动参数与环境变量保存为“环境”，多个账号共用，修改一处同步生效 |
 | 代理节点 | 支持 Clash 订阅节点（内置 Mihomo 内核，无需另装）与自定义 SOCKS5 / HTTP / HTTPS 节点，附出口检测与换 IP 链接 |
-| 防泄漏 | 内置本机中继，DNS、WebRTC、UDP/QUIC、IPv6 全部经节点或被阻止；节点失效时断网而非直连 |
+| 防泄漏 | 内置本机中继，DNS、UDP/QUIC、IPv6 全部经节点或被阻止；节点失效时断网而非直连 |
 | 沙盒隔离 | 可按环境开启：Windows 用 Sandboxie-Plus、macOS 用系统 Seatbelt 沙盒，账号只能经自己的中继出网，绕过代理的进程直接断网 |
 | 设备与网页指纹 | Windows 沙盒内的机器 ID、主机名、MAC、账号 SID、硬件序列号等按账号派生；Canvas、WebGL、字体、屏幕、CPU 与内存等网页指纹按账号派生 |
 | 出口保护 | 环境可绑定出口国家 / IP，启动前与运行中持续核对，出口不符时切断该账号网络 |
@@ -101,7 +101,7 @@ Claude 只看得到本机中继地址；节点的账号密码保存在 Hydra 内
 | 泄漏途径 | 处理方式 |
 | --- | --- |
 | DNS | 通过 SOCKS5 代理（`--proxy-server=socks5://…`）把域名原样交给节点解析；Claude 自身已关闭 DNS 预解析 |
-| WebRTC | `--force-webrtc-ip-handling-policy=disable_non_proxied_udp`，不暴露本机或 STUN 地址 |
+| WebRTC | 传入 `--force-webrtc-ip-handling-policy=disable_non_proxied_udp` 等开关。Electron 可能不采用这些开关，实际策略以 Claude 自身设置为准，Hydra 不能从外部保证 |
 | UDP / QUIC | `--disable-quic`；中继拒绝 SOCKS5 UDP ASSOCIATE |
 | IPv6 | Claude 只连接 127.0.0.1 中继，不直接使用本机 IPv6 |
 | 子进程 | Claude Code、MCP 等通过 `HTTP(S)_PROXY`、`ALL_PROXY`、`NODE_USE_ENV_PROXY` 指向同一中继 |
@@ -122,15 +122,17 @@ Claude 只看得到本机中继地址；节点的账号密码保存在 Hydra 内
 | 前提 | Windows 安装程序请求管理员授权，自动安装随包附带的 [Sandboxie-Plus 1.18.8](https://github.com/sandboxie-plus/Sandboxie/releases/tag/v1.18.8)，或复用已安装的组件。安装后在环境配置中打开或关闭「沙箱隔离」并保存 | 系统自带 Seatbelt，启用沙箱无需安装驱动或管理员授权 |
 | 网络 | 只允许连接本账号的本地中继，任何绕过代理的进程都会断网 | 拒绝一切出站连接，只放行本账号中继的端口；本机 Clash 等代理和其他账号的中继也连不上 |
 | DNS | 注入防护模块，拒绝系统 DNS 通道、拦截发往非本机地址的连接，域名只经节点解析 | 屏蔽系统 DNS 服务，域名只经节点解析 |
-| 文件与注册表 | 写入留在沙箱内（账号数据目录除外） | 不虚拟化，只限制网络 |
+| 文件与注册表 | 写入留在沙箱内（账号数据目录除外） | 不虚拟化；禁止读写其他账号的数据和 Hydra 配置 |
 | 设备标识 | 按账号派生，见 [设备与网页指纹](#设备与网页指纹) | 仍为主机本身的值 |
-| 启动校验 | 启动后核实 Claude 确实在沙箱中，否则立即关闭 | 启动前自检：沙盒内直连外部必须失败、中继必须可达，任一不成立就不启动 |
+| 启动校验 | 启动后核实 Claude 确实在沙箱中，否则立即关闭 | 启动前自检：中继可达、直连和其他本机端口被拒、读不到 Hydra 配置，任一不成立就不启动 |
 
 - 沙盒由 Claude 启动的所有子进程继承，包括 Claude Code、git 和 MCP 服务。Windows 沙箱内还会为 git 生成专用配置，把它的代理也指向中继。
 - 开启沙盒时会强制使用 **独立 Code** 目录，避免各账号报出同一个 Claude Code 设备 ID。
 - Windows 商店版会先复制一份到 Hydra 数据目录再装入沙箱，首次启动较慢。
 - Windows 沙箱默认静默启动。可从 **设置 → 沙箱设置 → 打开沙箱管理** 打开管理器。全新默认安装时组件位于 Hydra 目录下的 Sandboxie-Plus 子目录，不创建桌面快捷方式。自选 Hydra 安装目录时，沙箱组件使用 Sandboxie 的系统安装位置。
 - macOS 沙盒内的 Claude Code 连不上本机其他回环服务（如本地 MCP、IDE 扩展端口）。这是只放行中继端口的代价。
+- macOS 不允许沙箱嵌套，开启沙盒的账号必须以 `--no-sandbox` 运行 Claude，也就是关闭 Chromium 自带的渲染进程沙箱。网页一旦被攻击，影响范围会比平时大，文件规则只能降低这种影响。
+- macOS 沙盒内只有 Claude 主进程能打开链接和其他应用。Claude Code 等子进程不能用 `open` 或 AppleScript 启动应用，需要浏览器登录时请手动打开它给出的链接。
 
 实现细节与边界：[docs/macos-isolation-status.md](docs/macos-isolation-status.md)、[docs/fingerprint-device-isolation-status.md](docs/fingerprint-device-isolation-status.md)。
 
@@ -161,7 +163,7 @@ Claude 只看得到本机中继地址；节点的账号密码保存在 Hydra 内
 | 硬件 | CPU 核数与内存大小 |
 
 - Windows：作用于 **账号浏览器**，即登录与外部链接打开的独立窗口，它与账号使用同一出口 IP 和同一时区。
-- macOS：开启沙盒隔离时，通过本机调试通道在页面脚本之前注入 Claude 窗口，仅限 Hydra 创建的额外账号。这一层是尽力而为，注入失败会记录日志。
+- macOS：同样作用于账号浏览器，不注入 Claude 窗口。Claude 会拒绝带 `--remote-debugging-port` 的启动。
 
 **不覆盖的部分**：沙盒是进程级隔离，不是虚拟机。CPU 型号、内存大小、显卡与驱动版本仍与主机一致；macOS 上的主机名、MAC、`IOPlatformUUID`、硬件序列号仍为主机的值；你自己的 Chrome / Edge 不经过指纹脚本。需要完全独立的硬件环境时，请使用虚拟机。
 
@@ -221,9 +223,9 @@ Claude 只看得到本机中继地址；节点的账号密码保存在 Hydra 内
 | --- | --- | --- |
 | 多账号 | ✅ | ✅ |
 | 环境配置、代理节点与防泄漏中继 | ✅（商店版默认账号除外） | ✅ |
-| 沙盒隔离 | ✅ Sandboxie-Plus（网络、文件、注册表） | ✅ Seatbelt（仅网络） |
+| 沙盒隔离 | ✅ Sandboxie-Plus（网络、文件、注册表） | ✅ Seatbelt（网络与账号间文件访问，需关闭渲染进程沙箱） |
 | 设备标识派生 | ✅ 沙箱内 | ❌ 仍为主机值 |
-| 网页指纹 | ✅ 账号浏览器 | ✅ Claude 窗口（开启沙盒时） |
+| 网页指纹 | ✅ 账号浏览器 | ✅ 账号浏览器 |
 | 时区同步 | ⚠️ 子进程生效，窗口待实测 | ✅ |
 | 用量统计 | ✅ | ✅ |
 | 会话迁移 / 聊天续聊 | ✅ | ✅ |
