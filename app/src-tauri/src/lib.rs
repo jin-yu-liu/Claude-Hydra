@@ -169,7 +169,9 @@ fn list_environments() -> Vec<environment::EnvironmentView> {
 
 #[tauri::command]
 fn save_environment(app: AppHandle, id: Option<String>, input: environment::EnvironmentInput) -> Result<String, String> {
-    let id = environment::save(&current_install(&app)?, id.as_deref(), &input)?;
+    // An environment does not need Claude installed (#5): the install only matters for the
+    // Store-version check, which the launch repeats anyway.
+    let id = environment::save(current_install(&app).ok().as_ref(), id.as_deref(), &input)?;
     // Starting or re-checking a node can take seconds; never on the UI thread.
     relay::sync_soon();
     after_change(&app);

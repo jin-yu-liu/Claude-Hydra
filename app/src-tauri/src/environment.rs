@@ -215,13 +215,13 @@ fn build(input: &EnvironmentInput) -> Result<Environment, String> {
 }
 
 /// Creates (`id` = None) or updates an environment and returns its id.
-pub fn save(install: &crate::install::Install, id: Option<&str>, input: &EnvironmentInput) -> Result<String, String> {
+pub fn save(install: Option<&crate::install::Install>, id: Option<&str>, input: &EnvironmentInput) -> Result<String, String> {
     let mut env = build(input)?;
     if env.isolation == "sandboxie" { crate::sandbox::available()?; }
     settings::update_with(|s| {
         if let Some(id) = id { if !s.environments.contains_key(id) { return Err("这个环境配置已不存在。".into()); } }
         if s.environments.iter().any(|(k, e)| Some(k.as_str()) != id && e.name == env.name) { return Err(format!("已有名为“{}”的环境配置。", env.name)); }
-        if install.is_msix() && env.customizes_launch() && id.is_some_and(|id| s.account(crate::paths::DEFAULT_ID).environment.as_deref() == Some(id)) {
+        if install.is_some_and(|i| i.is_msix()) && env.customizes_launch() && id.is_some_and(|id| s.account(crate::paths::DEFAULT_ID).environment.as_deref() == Some(id)) {
             return Err("商店版默认账号正在使用此环境，而它无法应用代理、时区或启动参数。请先为默认账号取消此环境。".into());
         }
         let id = id.map(str::to_string).unwrap_or_else(|| new_id(s));

@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { api, errorText, type EnvironmentInput, type ExitInfo, type ExitRule } from "@/lib/api";
 import { EXIT_RULES, LOCALES, emptyEnvironment } from "@/lib/environment";
 import { Switch } from "./ui/switch";
@@ -43,6 +43,12 @@ export function EnvironmentDialog({ open, id, initial, detectedTimezone, exitBas
   const [sandbox, setSandbox] = useState<{ ok: boolean; text: string } | null>(null);
   const [baseline, setBaseline] = useState<string | null>(null);
   const [rebinding, setRebinding] = useState(false);
+  const errorRef = useRef<HTMLParagraphElement>(null);
+
+  // The error sits below every section; bring it into view or a failed save looks like a dead button (#5).
+  useEffect(() => {
+    if (error) errorRef.current?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+  }, [error]);
 
   useEffect(() => {
     if (!open) return;
@@ -171,7 +177,7 @@ export function EnvironmentDialog({ open, id, initial, detectedTimezone, exitBas
           </div>
         </section>
 
-        {error && <p className="selectable whitespace-pre-wrap rounded-xl bg-danger-soft px-4 py-3 text-[12.5px] text-danger">{error}</p>}
+        {error && <p ref={errorRef} className="selectable whitespace-pre-wrap rounded-xl bg-danger-soft px-4 py-3 text-[12.5px] text-danger">{error}</p>}
       </div>
     </Dialog>
   );
