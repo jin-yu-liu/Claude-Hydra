@@ -238,6 +238,15 @@ function tuic(link: string): Proxy {
   return p;
 }
 
+function anytls(link: string): Proxy {
+  const { name, query: q, userinfo, address } = split(link);
+  const at = hostPort(address);
+  if (!at || !userinfo) throw new Error("AnyTLS 链接格式无法识别。");
+  const p: Proxy = { name, type: "anytls", server: at.server, port: at.port, password: decode(userinfo), udp: true };
+  tls(p, q, "sni");
+  return p;
+}
+
 function socksOrHttp(link: string): Proxy {
   const { scheme, name, userinfo, address } = split(link);
   const at = hostPort(address);
@@ -253,12 +262,12 @@ function socksOrHttp(link: string): Proxy {
 }
 
 const PARSERS: Record<string, (link: string) => Proxy> = {
-  ss: shadowsocks, vmess, vless, trojan, hysteria2, hy2: hysteria2, tuic,
+  ss: shadowsocks, vmess, vless, trojan, hysteria2, hy2: hysteria2, tuic, anytls,
   socks: socksOrHttp, socks5: socksOrHttp, socks5h: socksOrHttp, http: socksOrHttp, https: socksOrHttp,
 };
 
 /** Link schemes the paste box understands, for hints and errors. */
-export const LINK_SCHEMES = "ss、vmess、vless、trojan、hysteria2 / hy2、tuic、socks5、http(s)";
+export const LINK_SCHEMES = "ss、vmess、vless、trojan、hysteria2 / hy2、tuic、anytls、socks5、http(s)";
 
 /** One share link as a Clash proxy entry. Errors are user-facing. */
 export function linkProxy(link: string): Proxy {
