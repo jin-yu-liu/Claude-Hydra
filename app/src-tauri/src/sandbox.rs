@@ -1,14 +1,18 @@
 //! Optional per-account isolation, opt-in per environment: a Sandboxie-Plus box on Windows, or a
-//! Seatbelt profile (`macos.rs`) on macOS. The Windows box also virtualizes files and the
-//! registry; the macOS profile confines the network and keeps the account out of other accounts'
-//! data, and is verified before the account starts.
+//! Seatbelt profile (`macos.rs`) on macOS. The Windows box also virtualizes the registry and the
+//! system's and other programs' files; the macOS profile confines the network and keeps the
+//! account out of other accounts' data, and is verified before the account starts.
 //!
 //! Without a box, Claude's network is routed through the account's relay by Chromium switches
 //! and proxy variables, which a process may ignore. Inside a box, Sandboxie enforces it:
 //! - `NetworkAccess`: everything is blocked except the account's relay on 127.0.0.1, so a
 //!   process that ignores the proxy simply has no network (fail closed), UDP included;
-//! - files and registry writes stay in the box, except the account's own data folder (so Hydra
-//!   still sees sessions and usage) and the link drop folder (see `browser`);
+//! - registry writes stay in the box. File writes reach the real disk, so what Claude Code
+//!   changes in a project is really changed, except where the box keeps its own copy (see
+//!   `kept_in_box`): Windows, program folders, AppData, the dot files and folders of the user
+//!   profile, and Hydra's folder. Inside that, the account's own data folder (so Hydra still sees
+//!   sessions and usage), its Code folder and the link drop folder (see `browser`) are real again;
+//!   other accounts' data and Hydra's settings are not;
 //! - after starting, Hydra asks Sandboxie whether the account's Claude really runs in its box,
 //!   and closes it if not (packaged Store builds may escape the box).
 //!
@@ -391,11 +395,23 @@ pub fn configure(id: &str, data_dir: &str, #[cfg_attr(not(windows), allow(unused
     // the other bitness (and any path added later) and silently reopen the leak.
     append("ClosedFilePath", r"C:\Windows\System32\wbem\*")?;
     append("ClosedFilePath", r"C:\Windows\SysWOW64\wbem\*")?;
+    // Sandboxie matches `\` only; a `/` path would lose to the broader rule for Hydra's folder.
+    let data_dir = &data_dir.replace('/', "\\");
     set("OpenFilePath", data_dir)?;
     append("OpenFilePath", &drop.to_string_lossy())?;
     let code = code_dir(id);
     std::fs::create_dir_all(&code).map_err(|e| e.to_string())?;
     append("OpenFilePath", &code.to_string_lossy())?;
+    // Writes reach the real disk (see the module note), with the box's own copy kept for
+    // `kept_in_box`. Sandboxie applies the most specific of the open and normal rules, so the
+    // account's folders above stay real inside Hydra's folder, and the closed rules below win over
+    // both. Only processes started after the reload see this, which is every launch.
+    for drive in local_drives() { append("OpenFilePath", &format!("{drive}*"))?; }
+    let exe = std::env::current_exe().ok();
+    let kept = kept_in_box(home().as_deref(), &crate::paths::storage_root(), exe.as_deref(), |k| std::env::var_os(k).filter(|v| !v.is_empty()).map(PathBuf::from));
+    for (i, path) in kept.iter().enumerate() {
+        if i == 0 { set("NormalFilePath", path)?; } else { append("NormalFilePath", path)?; }
+    }
     // Removing a passthrough rule still permits reading host files through copy-on-write.
     if let Some(home) = home() {
         for path in [home.join(".claude"), home.join(".claude.json*")] {
@@ -453,6 +469,49 @@ pub fn configure(id: &str, data_dir: &str, #[cfg_attr(not(windows), allow(unused
 /// The user profile folder (where Claude Code and git keep their per-user files).
 fn home() -> Option<PathBuf> {
     std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(PathBuf::from)
+}
+
+/// Roots of the local disks (fixed, removable and RAM disks), such as `C:\`, whose files the box
+/// writes for real. Network and optical drives are left out (`BlockNetworkFiles` closes shares).
+fn local_drives() -> Vec<String> {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Storage::FileSystem::{GetDriveTypeW, GetLogicalDrives};
+        let mask = unsafe { GetLogicalDrives() };
+        (0..26u8).filter(|i| mask & (1 << i) != 0).map(|i| format!("{}:\\", (b'A' + i) as char)).filter(|root| {
+            let wide: Vec<u16> = root.encode_utf16().chain([0]).collect();
+            // DRIVE_REMOVABLE, DRIVE_FIXED, DRIVE_RAMDISK
+            matches!(unsafe { GetDriveTypeW(wide.as_ptr()) }, 2 | 3 | 6)
+        }).collect()
+    }
+    #[cfg(not(windows))]
+    Vec::new()
+}
+
+/// What the box keeps its own copy of although the disks are open: writes there stay in the box
+/// (as every write did before) because they would change something outside the projects —
+/// the system and installed programs, other programs' settings and start-up items in AppData,
+/// tool configuration in the profile's dot files (`~/.gitconfig`, whose box copy points git at
+/// the relay, `.ssh`, `.npmrc`, shell start-up files), Hydra's program file (not its folder, which
+/// may be a downloads or projects folder), and Hydra's folder with the other accounts' data, its
+/// settings and the guard DLLs. `env` reads an environment variable.
+fn kept_in_box(home: Option<&Path>, storage: &Path, hydra_exe: Option<&Path>, env: impl Fn(&str) -> Option<PathBuf>) -> Vec<String> {
+    let mut paths: Vec<PathBuf> = ["SystemRoot", "ProgramFiles", "ProgramFiles(x86)", "ProgramW6432", "ProgramData"]
+        .iter().filter_map(|k| env(k)).collect();
+    if let Some(home) = home {
+        paths.push(home.join("AppData"));
+        paths.push(home.join(".*"));
+    }
+    paths.extend(hydra_exe.map(Path::to_path_buf));
+    paths.push(storage.to_path_buf());
+    let mut out: Vec<String> = Vec::new();
+    for path in paths {
+        let text = path.to_string_lossy().trim_end_matches(['\\', '/']).to_string();
+        // A drive root here would undo the open disks; it never is one in practice.
+        if text.is_empty() || text.ends_with(':') { continue; }
+        if !out.iter().any(|p| p.eq_ignore_ascii_case(&text)) { out.push(text); }
+    }
+    out
 }
 
 /// Where the box keeps its copy of `host_path`: Sandboxie maps the user profile to
@@ -1539,6 +1598,90 @@ if ($needed -gt 0) {
         if cfg!(windows) {
             assert_eq!(super::box_copy(root, std::path::Path::new(r"q:\data\x")), Some(root.join("drive").join("Q").join(r"data\x")));
         }
+    }
+
+    #[test]
+    fn kept_in_box_covers_system_profile_config_and_hydra() {
+        use std::path::{Path, PathBuf};
+        let env = |k: &str| match k {
+            "SystemRoot" => Some(PathBuf::from(r"C:\Windows")),
+            "ProgramFiles" | "ProgramW6432" => Some(PathBuf::from(r"C:\Program Files")),
+            "ProgramFiles(x86)" => Some(PathBuf::from(r"C:\Program Files (x86)\")),
+            "ProgramData" => Some(PathBuf::from(r"C:\")), // a drive root must never be kept
+            _ => None,
+        };
+        let kept = super::kept_in_box(Some(Path::new(r"C:\Users\u")), Path::new(r"D:\ClaudeHydra"), Some(Path::new(r"C:\Users\u\Downloads\hydra.exe")), env);
+        let home = |p: &str| Path::new(r"C:\Users\u").join(p).to_string_lossy().into_owned();
+        assert_eq!(kept, vec![
+            r"C:\Windows".to_string(), r"C:\Program Files".into(), r"C:\Program Files (x86)".into(),
+            home("AppData"), home(".*"), home(r"Downloads\hydra.exe"), r"D:\ClaudeHydra".into(),
+        ]);
+        // The projects themselves (the profile, its Downloads folder, other drives) are not kept.
+        assert!(!kept.iter().any(|p| p.eq_ignore_ascii_case(r"C:\Users\u") || p.ends_with("Downloads")));
+    }
+
+    /// Files Claude Code edits in a project reach the real disk, while the box keeps its own copy
+    /// of AppData, the profile's dot files, the system, and the other accounts' data, and the
+    /// account's own folders inside Hydra's stay real.
+    /// `CLAUDE_HYDRA_ROOT=<scratch> cargo test --lib sandboxie_project_writes -- --ignored --nocapture`
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires Sandboxie-Plus and CLAUDE_HYDRA_ROOT pointing to a scratch folder"]
+    fn sandboxie_project_writes_reach_the_disk() {
+        use std::process::Command;
+        assert!(std::env::var_os("CLAUDE_HYDRA_ROOT").is_some(), "set CLAUDE_HYDRA_ROOT to a scratch folder");
+        let id = "hydra-files-test";
+        let root = crate::paths::storage_root();
+        let data = root.join("files-data");
+        let other = root.join("profiles").join("other-account");
+        let home = super::home().unwrap();
+        let tag = format!("hydra-files-{}", std::process::id());
+        // A project in the user profile and one at the top of each local drive but the system's.
+        let mut projects = vec![home.join(&tag)];
+        for drive in super::local_drives() {
+            let p = std::path::PathBuf::from(&drive).join(&tag);
+            if !drive.eq_ignore_ascii_case(r"C:\") && std::fs::create_dir_all(&p).is_ok() { projects.push(p); break; }
+        }
+        let kept = [home.join("AppData").join("Local").join(&tag), home.join(format!(".{tag}")), other.clone()];
+        for d in projects.iter().chain(&kept).chain([&data]) { let _ = std::fs::remove_dir_all(d); std::fs::create_dir_all(d).unwrap(); }
+        std::fs::write(projects[0].join("edit.txt"), "host\r\n").unwrap();
+        std::fs::write(projects[0].join("gone.txt"), "host\r\n").unwrap();
+        let name = super::configure(id, &data.to_string_lossy(), &[data.join("claude-code-sessions")], None).unwrap();
+        let mut script = String::from("@echo off\r\n");
+        for p in &projects {
+            script.push_str(&format!("echo boxed> \"{0}\\new.txt\"\r\nmkdir \"{0}\\sub\\deep\"\r\necho boxed> \"{0}\\sub\\deep\\f.txt\"\r\n", p.display()));
+        }
+        let first = projects[0].display();
+        script.push_str(&format!("echo boxed>> \"{first}\\edit.txt\"\r\ndel \"{first}\\gone.txt\"\r\n"));
+        for p in kept.iter().chain([&data, &super::code_dir(id)]) { script.push_str(&format!("echo boxed> \"{}\\k.txt\"\r\n", p.display())); }
+        let probe = data.join("probe.cmd");
+        std::fs::write(&probe, script).unwrap();
+        let cmd = std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join("System32").join("cmd.exe");
+        let status = Command::new(super::available().unwrap().join("Start.exe"))
+            .args([&format!("/box:{name}"), "/silent", "/wait"]).arg(cmd).args(["/d", "/c"]).arg(&probe).status().unwrap();
+        let _ = Command::new(super::available().unwrap().join("Start.exe")).args([&format!("/box:{name}"), "/silent", "/terminate"]).status();
+        let cleanup = || for d in projects.iter().chain(&kept) { let _ = std::fs::remove_dir_all(d); };
+        let checks = || -> Result<(), String> {
+            if !status.success() { return Err(format!("boxed probe failed: {status}")); }
+            for p in &projects {
+                for f in ["new.txt", r"sub\deep\f.txt"] {
+                    if !p.join(f).is_file() { return Err(format!("{} did not reach the disk", p.join(f).display())); }
+                }
+            }
+            let edit = std::fs::read_to_string(projects[0].join("edit.txt")).unwrap();
+            if edit != "host\r\nboxed\r\n" { return Err(format!("edit did not reach the disk: {edit:?}")); }
+            if projects[0].join("gone.txt").exists() { return Err("delete did not reach the disk".into()); }
+            for p in &kept {
+                if p.join("k.txt").exists() { return Err(format!("{} should stay in the box", p.display())); }
+            }
+            for p in [&data, &super::code_dir(id)] {
+                if !p.join("k.txt").is_file() { return Err(format!("{} should stay real", p.display())); }
+            }
+            Ok(())
+        };
+        let result = checks();
+        cleanup();
+        result.unwrap();
     }
 
     #[test]
