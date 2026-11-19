@@ -41,12 +41,16 @@ const CHECK_TIMEOUT_SECS: u64 = 15;
 
 /// Open client connections of one relay, so a block can close them.
 #[derive(Default)]
-struct Conns { next: AtomicU64, open: Mutex<HashMap<u64, TcpStream>> }
+/// The open connections of one relay, so a cut can close them. Each entry is the handler's own
+/// socket, shared rather than duplicated: on Windows a duplicated socket handle is inheritable
+/// until it is fixed up, and a process Hydra started in that moment (Claude, Mihomo, PowerShell)
+/// kept the connection open after the relay closed it, then reset it when it exited.
+struct Conns { next: AtomicU64, open: Mutex<HashMap<u64, Arc<TcpStream>>> }
 
 impl Conns {
-    fn add(&self, s: &TcpStream) -> Option<u64> {
+    fn add(&self, s: &Arc<TcpStream>) -> Option<u64> {
         let id = self.next.fetch_add(1, Ordering::SeqCst);
-        self.open.lock().ok()?.insert(id, s.try_clone().ok()?);
+        self.open.lock().ok()?.insert(id, Arc::clone(s));
         Some(id)
     }
     fn remove(&self, id: u64) { if let Ok(mut m) = self.open.lock() { m.remove(&id); } }
@@ -470,6 +474,7 @@ fn serve(listener: TcpListener, gate: Gate) {
         let Ok(client) = conn else { continue };
         // Only loopback clients; the listener is bound to 127.0.0.1 but be explicit.
         if !client.peer_addr().map(|a| a.ip().is_loopback()).unwrap_or(false) { continue; }
+        let client = Arc::new(client);
         // Register before looking at the switch: `block` sets it and then closes every
         // registered connection, so a connection accepted around that moment is either seen
         // here as paused or closed there. An unregistered connection could not be cut later.
@@ -482,7 +487,7 @@ fn serve(listener: TcpListener, gate: Gate) {
             let conns = conns.clone();
             move || {
                 // Blocked: only the identity question is answered, nothing is forwarded.
-                let _ = handle(client, &node, &tag, paused);
+                let _ = handle(&client, &node, &tag, paused);
                 conns.remove(slot);
             }
         });
@@ -519,7 +524,7 @@ impl Target {
     }
 }
 
-fn handle(client: TcpStream, node: &NodeConfig, tag: &str, paused: bool) -> io::Result<()> {
+fn handle(client: &TcpStream, node: &NodeConfig, tag: &str, paused: bool) -> io::Result<()> {
     client.set_read_timeout(Some(if paused { Duration::from_secs(3) } else { HANDSHAKE_TIMEOUT }))?;
     client.set_nodelay(true)?;
     let mut first = [0u8; 1];
@@ -527,7 +532,8 @@ fn handle(client: TcpStream, node: &NodeConfig, tag: &str, paused: bool) -> io::
     if first[0] == 5 { if paused { Ok(()) } else { socks_server(client, node) } } else { http_server(client, node, tag, paused) }
 }
 
-fn socks_server(mut client: TcpStream, node: &NodeConfig) -> io::Result<()> {
+fn socks_server(client: &TcpStream, node: &NodeConfig) -> io::Result<()> {
+    let mut client = client;
     let mut head = [0u8; 2];
     client.read_exact(&mut head)?;
     let mut methods = vec![0u8; head[1] as usize];
@@ -539,7 +545,7 @@ fn socks_server(mut client: TcpStream, node: &NodeConfig) -> io::Result<()> {
     let host = read_socks_addr(&mut client, req[3])?;
     let mut port = [0u8; 2];
     client.read_exact(&mut port)?;
-    let reply = |client: &mut TcpStream, code: u8| client.write_all(&[5, code, 0, 1, 0, 0, 0, 0, 0, 0]);
+    let reply = |client: &mut &TcpStream, code: u8| client.write_all(&[5, code, 0, 1, 0, 0, 0, 0, 0, 0]);
     if req[1] != 1 {
         // UDP ASSOCIATE / BIND: refused so UDP never leaves outside the node.
         return reply(&mut client, 7);
@@ -580,13 +586,14 @@ fn read_head(s: &mut impl Read) -> io::Result<(String, Vec<u8>)> {
     }
 }
 
-fn http_server(mut client: TcpStream, node: &NodeConfig, tag: &str, paused: bool) -> io::Result<()> {
+fn http_server(client: &TcpStream, node: &NodeConfig, tag: &str, paused: bool) -> io::Result<()> {
+    let mut client = client;
     let (head, rest) = read_head(&mut client)?;
     let mut lines = head.split("\r\n");
     let request = lines.next().unwrap_or_default();
     let mut parts = request.split(' ');
     let (method, uri, version) = (parts.next().unwrap_or_default(), parts.next().unwrap_or_default(), parts.next().unwrap_or("HTTP/1.1"));
-    let bad = |client: &mut TcpStream, code: &str| client.write_all(format!("HTTP/1.1 {code}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n").as_bytes());
+    let bad = |client: &mut &TcpStream, code: &str| client.write_all(format!("HTTP/1.1 {code}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n").as_bytes());
     // Origin-form is never a proxy request, so this path cannot shadow a real destination.
     if method == "GET" && uri == IDENTITY_PATH && !tag.is_empty() {
         return client.write_all(format!("HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{tag}", tag.len()).as_bytes());
@@ -758,15 +765,17 @@ fn copy_half(mut from: impl Read, mut to: impl Write) -> io::Result<u64> {
     }
 }
 
-fn pipe(client: TcpStream, upstream: Upstream) -> io::Result<()> {
+fn pipe(client: &TcpStream, upstream: Upstream) -> io::Result<()> {
     client.set_read_timeout(None)?;
     match upstream {
         Upstream::Tcp(up) => {
-            let (c2, u2) = (client.try_clone()?, up.try_clone()?);
-            let t = std::thread::spawn(move || { let _ = copy_half(&c2, &u2); let _ = u2.shutdown(Shutdown::Write); });
-            let _ = copy_half(&up, &client);
-            let _ = client.shutdown(Shutdown::Write);
-            let _ = t.join();
+            // Both directions share the two sockets by reference; a cloned handle would be
+            // inheritable on Windows (see `Conns`).
+            std::thread::scope(|scope| {
+                scope.spawn(|| { let _ = copy_half(client, &up); let _ = up.shutdown(Shutdown::Write); });
+                let _ = copy_half(&up, client);
+                let _ = client.shutdown(Shutdown::Write);
+            });
             Ok(())
         }
         Upstream::Tls(mut tls) => {
@@ -888,6 +897,24 @@ mod tests {
         assert!(matches!(validate_exit(id), Verdict::Unverified(_)));
         refused();
         stop(id);
+    }
+
+    /// A connection is kept for cutting as the handler's own socket, never as a second handle:
+    /// a duplicated handle can leak into a child process started at that moment, which then
+    /// holds the connection open and resets it when it exits.
+    #[test]
+    fn kept_connections_share_the_handlers_socket() {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        let accepted = Arc::new(l.accept().unwrap().0);
+        let conns = Conns { next: AtomicU64::new(0), open: Mutex::new(HashMap::new()) };
+        let slot = conns.add(&accepted).unwrap();
+        assert!(Arc::ptr_eq(&conns.open.lock().unwrap()[&slot], &accepted));
+        // Closing the kept connections still cuts the client off.
+        conns.close_all();
+        let mut buf = [0u8; 1];
+        client.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        assert!(matches!(client.read(&mut buf), Ok(0) | Err(_)));
     }
 
     #[test]
@@ -1042,7 +1069,7 @@ mod tests {
                 let mut port = [0u8; 2]; s.read_exact(&mut port).unwrap();
                 let up = TcpStream::connect((host.as_str(), u16::from_be_bytes(port))).unwrap();
                 s.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).unwrap();
-                let _ = pipe(s, Upstream::Tcp(up));
+                let _ = pipe(&s, Upstream::Tcp(up));
             });
         });
         port
